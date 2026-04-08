@@ -1,0 +1,5 @@
+# Ignore dataset
+Dataset RM/
+
+# atau lebih spesifik
+*.gz
