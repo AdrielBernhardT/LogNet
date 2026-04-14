@@ -5,3 +5,4 @@ parsed/
 # atau lebih spesifik
 *.gz
 *.parquet
+*.csv
