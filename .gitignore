@@ -1,5 +1,7 @@
 # Ignore dataset
 Dataset RM/
+parsed/
 
 # atau lebih spesifik
 *.gz
+*.parquet
