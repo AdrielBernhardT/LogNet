@@ -98,8 +98,6 @@ for p in [AUTH_PATH, REDTEAM_PATH]:
 ------------------------------------------------------------
 Cell 5 - Build Node Map:
 
-import gc
-
 def build_node_map(auth_path, chunksize=500_000):
     log.info("Tahap 1: Scan file untuk kumpulkan node unik...")
     all_users, all_computers = set(), set()
@@ -243,75 +241,17 @@ plt.show()
 print("Plot disimpan ke ./parsed/redteam_analysis.png")
 
 ------------------------------------------------------------
-Cell 10 - Attacker Profile and Classification Parameter:
+Cell 10 - Variable Check:
 
-# Profil tiap attacker berdasarkan data redteam
-attacker_profiles = df_red.groupby("src_user").agg(
-    n_events    = ("dst_computer", "count"),
-    n_targets   = ("dst_computer", "nunique"),
-    duration    = ("time", lambda x: x.max() - x.min()),
-).reset_index()
-
-# PERBAIKAN — prioritas lebih eksplisit:
-def classify_attacker(row):
-    duration_hrs = row["duration"] / 3600
-    n_targets    = row["n_targets"]
-    if duration_hrs > 100 and n_targets >= 5:
-        return 2   # Lateral Movement (cek duluan)
-    elif duration_hrs > 20:
-        return 3   # Persistence
-    else:
-        return 1   # Reconnaissance (default)
-
-attacker_profiles["attack_class"] = attacker_profiles.apply(classify_attacker, axis=1)
-
-# Ringkasan distribusi kelas
-print("Distribusi kelas serangan:")
-print(attacker_profiles.groupby("attack_class").agg(
-    n_attackers = ("src_user", "count"),
-    total_events = ("n_events", "sum"),
-).rename(index={1:"Reconnaissance", 2:"Lateral movement", 3:"Persistence"}))
-
-# Simpan profil
-attacker_profiles.to_parquet("./parsed/attacker_profiles.parquet", index=False)
-print("\nAttacker profiles disimpan.")
-print(attacker_profiles[["src_user","n_events","n_targets","duration","attack_class"]].to_string())
-
-------------------------------------------------------------
-Cell 11 - Attack Classification:
-
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-# Buat lookup: src_user → attack_class
-user_class_map = dict(zip(
-    attacker_profiles["src_user"],
-    attacker_profiles["attack_class"]
-))
-
-# Buat lookup redteam dengan class: (time,src_user,src_computer,dst_computer) → class
-redteam_class_lookup = {}
-for _, row in df_red.iterrows():
-    key = (str(int(row["time"])), str(row["src_user"]),
-           str(row["src_computer"]), str(row["dst_computer"]))
-    redteam_class_lookup[key] = user_class_map.get(row["src_user"], 1)
-
-print(f"Redteam class lookup: {len(redteam_class_lookup)} entries")
-print(f"Kelas yang ada: {set(redteam_class_lookup.values())}")
-
-------------------------------------------------------------
-
-Cell 12 - Variable Check:
-
-# 1. Load node_map dari parquet
+# Load node_map
 node_df  = pd.read_parquet("./parsed/node_map.parquet")
 node_map = dict(zip(node_df["name"], node_df["node_id"]))
 print(f"node_map loaded: {len(node_map):,} nodes")
 
-# 2. Load redteam lookup
+# Load redteam — hanya butuh binary lookup (normal vs anomaly)
 df_red = pd.read_csv(
     REDTEAM_PATH, header=None,
-    names=["time","src_user","src_computer","dst_computer"],
+    names=["time", "src_user", "src_computer", "dst_computer"],
     compression="gzip", dtype=str,
 )
 df_red["time"] = df_red["time"].astype(int)
@@ -323,79 +263,33 @@ redteam_lookup = set(zip(
     df_red["src_computer"].fillna(""),
     df_red["dst_computer"].fillna(""),
 ))
-print(f"redteam_lookup loaded: {len(redteam_lookup):,} events")
-
-# 3. Load attacker profiles dan build class lookup
-attacker_profiles = pd.read_parquet("./parsed/attacker_profiles.parquet")
-
-user_class_map = dict(zip(
-    attacker_profiles["src_user"],
-    attacker_profiles["attack_class"]
-))
-
-redteam_class_lookup = {}
-for _, row in df_red.iterrows():
-    key = (
-        str(int(row["time"])),
-        str(row["src_user"]) if pd.notna(row["src_user"]) else "",
-        str(row["src_computer"]),
-        str(row["dst_computer"]),
-    )
-    redteam_class_lookup[key] = user_class_map.get(row["src_user"], 1)
-
-print(f"redteam_class_lookup: {len(redteam_class_lookup):,} entries")
-print(f"Kelas: {set(redteam_class_lookup.values())}")
+print(f"redteam_lookup loaded: {len(redteam_lookup):,} attack events")
 
 ------------------------------------------------------------
-Cell 13 - Auth Process:
-
-def get_last_completed_chunk(output_dir):
-    files = sorted(Path(output_dir).glob("edges_batch_*.parquet"))
-    if not files:
-        return 0
-    last_batch = int(files[-1].stem.split("_")[-1])
-    return last_batch * 10
+Cell 11 - Auth Process:
 
 def encode_features(chunk):
-    n = len(chunk)
-    feat = np.zeros((n, 6), dtype=np.float32)
-    feat[:, 0] = chunk["auth_type"].map(AUTH_TYPE_MAP).fillna(-1).values
-    feat[:, 1] = chunk["logon_type"].map(LOGON_TYPE_MAP).fillna(-1).values
-    feat[:, 2] = chunk["auth_orientation"].map(AUTH_ORIENT_MAP).fillna(-1).values
-    feat[:, 3] = chunk["success"].map({"Success": 1.0, "Failure": 0.0}).fillna(-1.0).values
-    seconds_in_day = chunk["time"].astype(np.int32) % 86400
-    feat[:, 4] = (seconds_in_day / 3600.0).astype(np.float32)
-    feat[:, 5] = ((feat[:, 4] < 8.0) | (feat[:, 4] >= 18.0)).astype(np.float32)
-    return feat
+    auth_type   = chunk["auth_type"].map(AUTH_TYPE_MAP).fillna(-1).astype(np.float32)
+    logon_type  = chunk["logon_type"].map(LOGON_TYPE_MAP).fillna(-1).astype(np.float32)
+    auth_orient = chunk["auth_orient"].map(AUTH_ORIENT_MAP).fillna(-1).astype(np.float32)  
+    success     = (chunk["success"] == "Success").astype(np.float32)
+    hour        = (chunk["time"] % 86400 / 3600).astype(np.float32)
+    off_hours   = ((hour < 7) | (hour > 19)).astype(np.float32)
+    return np.stack([auth_type, logon_type, auth_orient, success, hour, off_hours], axis=1)
 
 def process_auth_v2(auth_path, node_map, redteam_lookup,
-                    redteam_class_lookup, output_dir, chunksize=500_000):
-    """
-    Versi 2: sama dengan sebelumnya tapi tambah kolom:
-      - src_user_id  : integer ID dari src_user (bukan src_computer)
-      - attack_class : 0=normal, 1=recon, 2=lateral, 3=persistence
-    """
+                    output_dir, chunksize=500_000):
+
     output_dir = Path(output_dir)
 
-    # Hapus file lama dulu
-    old_edges = sorted(output_dir.glob("edges_batch_*.parquet"))
-    old_feats = sorted(output_dir.glob("feats_batch_*.parquet"))
-    for f in old_edges + old_feats:
+    for f in sorted(output_dir.glob("edges_batch_*.parquet")) + \
+             sorted(output_dir.glob("feats_batch_*.parquet")):
         f.unlink()
-    log.info(f"File lama dihapus: {len(old_edges)} edge batch, {len(old_feats)} feat batch")
 
-    # Hapus juga file final lama agar tidak tercampur
     for fname in ["auth_edges.parquet", "auth_feats.parquet"]:
         fpath = output_dir / fname
         if fpath.exists():
             fpath.unlink()
-            log.info(f"File final lama dihapus: {fname}")
-
-    skip_chunks = get_last_completed_chunk(output_dir)
-    if skip_chunks > 0:
-        log.info(f"RESUME: melewati {skip_chunks:,} chunk pertama")
-    else:
-        log.info("Mulai dari awal...")
 
     reader = pd.read_csv(
         auth_path, header=None, names=AUTH_COLUMNS, dtype=str,
@@ -415,13 +309,6 @@ def process_auth_v2(auth_path, node_map, redteam_lookup,
     for chunk in reader:
         chunk_count += 1
 
-        if chunk_count <= skip_chunks:
-            if chunk_count % 100 == 0:
-                log.info(f"  Skip chunk {chunk_count:,}/{skip_chunks:,} ...")
-            del chunk
-            continue
-
-        # --- Cleaning ---
         chunk = chunk.dropna(subset=["src_computer", "dst_computer"])
         if len(chunk) == 0:
             continue
@@ -430,57 +317,43 @@ def process_auth_v2(auth_path, node_map, redteam_lookup,
         chunk = chunk.dropna(subset=["time"])
         chunk["time"] = chunk["time"].astype(np.int32)
 
-        # --- Node ID mapping ---
-        # src_computer → node ID (untuk graph edge)
         src_ids = ("c_" + chunk["src_computer"]).map(node_map).fillna(-1).astype(np.int32)
         dst_ids = ("c_" + chunk["dst_computer"]).map(node_map).fillna(-1).astype(np.int32)
 
-        # src_user → node ID (untuk klasifikasi — bisa NaN jika user kosong)
-        src_user_ids = ("u_" + chunk["src_user"].fillna("UNKNOWN")).map(node_map).fillna(-1).astype(np.int32)
-
         valid   = (src_ids != -1) & (dst_ids != -1)
-        chunk        = chunk[valid].reset_index(drop=True)
-        src_ids      = src_ids[valid].reset_index(drop=True)
-        dst_ids      = dst_ids[valid].reset_index(drop=True)
-        src_user_ids = src_user_ids[valid].reset_index(drop=True)
+        chunk   = chunk[valid].reset_index(drop=True)
+        src_ids = src_ids[valid].reset_index(drop=True)
+        dst_ids = dst_ids[valid].reset_index(drop=True)
+
         if len(chunk) == 0:
             continue
 
-        # --- Label + attack_class matching ---
         chunk["_key"] = (chunk["time"].astype(str) + "|" +
-                        chunk["src_user"].fillna("") + "|" +
-                        chunk["src_computer"] + "|" +
-                        chunk["dst_computer"])
-        
-        labels = chunk["_key"].isin(redteam_keys).astype(np.int8)
+                         chunk["src_user"].fillna("") + "|" +
+                         chunk["src_computer"] + "|" +
+                         chunk["dst_computer"])
 
-        # FIX: isi attack_class dari redteam_class_lookup
-        redteam_keys_str = {"|".join(k): v for k, v in redteam_class_lookup.items()}
-        attack_class = chunk["_key"].map(redteam_keys_str).fillna(0).values.astype(np.int8)
+        # Hanya binary label: 0=normal, 1=anomaly
+        labels = chunk["_key"].isin(redteam_keys).astype(np.int8)
 
         n_attack = int(labels.sum())
         total_attack += n_attack
         if n_attack > 0:
-            log.info(f"  Chunk {chunk_count}: {n_attack} attacks "
-                    f"(recon={int((attack_class==1).sum())}, "   # ← sekarang terisi
-                    f"lateral={int((attack_class==2).sum())}, "  # ← sekarang terisi
-                    f"persist={int((attack_class==3).sum())})")  # ← sekarang terisi
+            log.info(f"  Chunk {chunk_count}: {n_attack} anomaly events")
 
-        # --- Encode fitur ---
         feats = encode_features(chunk)
 
+        # Tidak ada kolom attack_class
         batch_edges.append(pd.DataFrame({
-            "src_id"      : src_ids.values,
-            "dst_id"      : dst_ids.values,
-            "src_user_id" : src_user_ids.values,
-            "timestamp"   : chunk["time"].values,
-            "label"       : labels,
-            "attack_class": attack_class,
+            "src_id"   : src_ids.values,
+            "dst_id"   : dst_ids.values,
+            "timestamp": chunk["time"].values,
+            "label"    : labels,
         }))
         batch_feats.append(pd.DataFrame(
             feats,
-            columns=["feat_auth_type","feat_logon_type","feat_auth_orient",
-                     "feat_success","feat_hour","feat_offhours"]
+            columns=["feat_auth_type", "feat_logon_type", "feat_auth_orient",
+                     "feat_success", "feat_hour", "feat_offhours"]
         ))
         total_edges += len(chunk)
 
@@ -493,9 +366,8 @@ def process_auth_v2(auth_path, node_map, redteam_lookup,
             batch_edges = []
             batch_feats = []
             gc.collect()
-            log.info(f"  Chunk {chunk_count:,} | edges: {total_edges:,} | attacks: {total_attack:,}")
+            log.info(f"  Chunk {chunk_count:,} | edges: {total_edges:,} | anomaly: {total_attack:,}")
 
-    # Flush sisa
     if batch_edges:
         batch_idx = (chunk_count // BATCH_WRITE) + 1
         pd.concat(batch_edges, ignore_index=True).to_parquet(
@@ -503,21 +375,19 @@ def process_auth_v2(auth_path, node_map, redteam_lookup,
         pd.concat(batch_feats, ignore_index=True).to_parquet(
             output_dir / f"feats_batch_{batch_idx:04d}.parquet", index=False)
 
-    log.info(f"SELESAI: {total_edges:,} edges, {total_attack:,} attacks")
+    log.info(f"SELESAI: {total_edges:,} edges, {total_attack:,} anomaly events")
 
-# Pastikan redteam_class_lookup sudah ada dari Cell 13
-# Lalu jalankan
+
 process_auth_v2(
-    auth_path            = AUTH_PATH,
-    node_map             = node_map,
-    redteam_lookup       = redteam_lookup,
-    redteam_class_lookup = redteam_class_lookup,
-    output_dir           = OUTPUT_DIR,
-    chunksize            = CHUNKSIZE,
+    auth_path      = AUTH_PATH,
+    node_map       = node_map,
+    redteam_lookup = redteam_lookup,
+    output_dir     = OUTPUT_DIR,
+    chunksize      = CHUNKSIZE,
 )
 
 ------------------------------------------------------------
-Cell 14 - Merge:
+Cell 12 - Merge:
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -588,7 +458,7 @@ def merge_batches_safe(output_dir):
 merge_batches_safe(OUTPUT_DIR)
 
 ------------------------------------------------------------
-Cell 15 - Check parsed Folder:
+Cell 13 - Check parsed Folder:
 
 import os
 
@@ -606,7 +476,7 @@ else:
 print(f"\nTotal files: {len(list(parsed.iterdir()))}")
 
 ------------------------------------------------------------
-Cell 16 - Checking File Path:
+Cell 14 - Checking File Path:
 
 # Cek juga di mana notebook ini berjalan
 print(f"Working directory: {os.getcwd()}")
@@ -620,7 +490,7 @@ for root, dirs, files in os.walk("."):
             print(f"  {full:<60} {size_mb:.1f} MB")
 
 ------------------------------------------------------------
-Cell 17 - Categorizing Attack:
+Cell 15 - Categorizing Attack:
 
 import pyarrow.parquet as pq
 
@@ -649,101 +519,36 @@ print(f"Attack ratio : {total_attack / max(total_edges,1):.8%}")
 print(f"Time range   : {ts_min:,} - {ts_max:,}")
 
 ------------------------------------------------------------
-Cell 18 - Checking Edges:
+Cell 16 - Checking Edges:
 
-def verify_attack_class_distribution(output_dir="./parsed"):
-    """
-    Verifikasi bahwa:
-    1. Semua label==1 memiliki attack_class > 0  (tidak ada yang 0)
-    2. Semua label==0 memiliki attack_class == 0
-    3. Distribusi kelas attack sudah benar
-    """
-    pf = pq.ParquetFile(f"{output_dir}/auth_edges.parquet")
- 
-    total         = 0
-    attack_total  = 0
-    class_counts  = {0: 0, 1: 0, 2: 0, 3: 0}
-    bug_count     = 0  # label==1 tapi attack_class==0 (harusnya tidak ada)
- 
-    for batch in pf.iter_batches(batch_size=5_000_000,
-                                  columns=["label", "attack_class"]):
-        df = batch.to_pandas()
-        total        += len(df)
-        attack_total += int(df["label"].sum())
- 
-        for cls, cnt in df["attack_class"].value_counts().items():
-            class_counts[int(cls)] = class_counts.get(int(cls), 0) + int(cnt)
- 
-        # Cek inkonsistensi: label==1 tapi class==0
-        bad = df[(df["label"] == 1) & (df["attack_class"] == 0)]
-        bug_count += len(bad)
- 
-        del df
-        gc.collect()
- 
-    print("=" * 50)
-    print("VERIFIKASI DISTRIBUSI attack_class")
-    print("=" * 50)
-    print(f"Total edges    : {total:,}")
-    print(f"Total attacks  : {attack_total:,}")
-    print(f"\nDistribusi attack_class:")
-    print(f"  0 (Normal)      : {class_counts.get(0, 0):,}  ← hanya dari label==0")
-    print(f"  1 (Recon)       : {class_counts.get(1, 0):,}")
-    print(f"  2 (Lateral)     : {class_counts.get(2, 0):,}")
-    print(f"  3 (Persistence) : {class_counts.get(3, 0):,}")
- 
-    if bug_count > 0:
-        print(f"\n  ⚠ WARNING: {bug_count} event dengan label==1 tapi attack_class==0!")
-        print(f"     → Perlu re-run process_auth_v2 untuk memperbaiki.")
-    else:
-        print(f"\n  ✓ Tidak ada inkonsistensi label vs attack_class.")
- 
-    return bug_count == 0
- 
-# Jalankan verifikasi
-verify_attack_class_distribution()
-
-------------------------------------------------------------
-Cell 19 - Checking Distribution Attack and Label:
-
-import pyarrow.parquet as pq
-
-# Cek skema kolom auth_edges
+# Cell 18 - Verifikasi sederhana
 pf = pq.ParquetFile("./parsed/auth_edges.parquet")
-print("Skema auth_edges.parquet:")
-print(pf.schema)
 
-print("\nSkema auth_feats.parquet:")
-pf2 = pq.ParquetFile("./parsed/auth_feats.parquet")
-print(pf2.schema)
+total_edges  = 0
+total_attack = 0
 
-# Cek distribusi attack_class
-batch = next(pf.iter_batches(batch_size=10_000_000, columns=["label","attack_class"]))
-df_sample = batch.to_pandas()
-print(f"\nDistribusi label:")
-print(df_sample["label"].value_counts())
-print(f"\nDistribusi attack_class:")
-print(df_sample["attack_class"].value_counts())
-del df_sample
-gc.collect()
+for batch in pf.iter_batches(batch_size=5_000_000, columns=["label"]):
+    df = batch.to_pandas()
+    total_edges  += len(df)
+    total_attack += int(df["label"].sum())
+    del df
+    gc.collect()
+
+print(f"Total edges  : {total_edges:,}")
+print(f"Anomaly (1)  : {total_attack:,}")
+print(f"Normal  (0)  : {total_edges - total_attack:,}")
+print(f"Anomaly ratio: {total_attack / max(total_edges, 1):.8%}")
 
 ------------------------------------------------------------
-Cell 20 - Load Split Config + Constanta:
+Cell 17 - Load Split Config + Constanta:
 
-# Strategi: attack-aware split
-# Train : hari 0–6   (~50 attacks, recon awal)
-# Val   : hari 7–14  (~574 attacks, bulk serangan)
-# Test  : hari 15–57 (~78 attacks, tail + periode tenang)
-
-import pyarrow.parquet as pq
-import pandas as pd
-import gc
- 
 pf = pq.ParquetFile("./parsed/auth_edges.parquet")
  
 ts_min     = float('inf')
 ts_max     = float('-inf')
 total_rows = 0
+TS_MIN = ts_min
+TS_MAX = ts_max
  
 for batch in pf.iter_batches(batch_size=5_000_000, columns=["timestamp"]):
     df = batch.to_pandas()
@@ -788,9 +593,8 @@ print(f"NUM_CLASSES = {NUM_CLASSES}  (1=Recon, 2=Lateral, 3=Persistence)")
 print(f"best_thresh default = {best_thresh}  (akan di-update setelah eval)")
 
 ------------------------------------------------------------
-Cell 21 - Temporal Graph Network Architecture:
+Cell 18 - Temporal Graph Network Architecture:
 
-# MemoryModule 
 class MemoryModule(nn.Module):
     def __init__(self, num_nodes, memory_dim):
         super().__init__()
@@ -812,11 +616,11 @@ class MemoryModule(nn.Module):
         new_mem = self.gru(messages, old_mem)
         self.memory[node_ids_cpu] = new_mem.detach().cpu()
 
-#  MessageModule 
+
 class MessageModule(nn.Module):
     def __init__(self, memory_dim, edge_feat_dim, message_dim):
         super().__init__()
-        input_dim = memory_dim * 2 + edge_feat_dim + 1  # +1 untuk delta_t
+        input_dim = memory_dim * 2 + edge_feat_dim + 1
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, message_dim),
             nn.ReLU(),
@@ -828,109 +632,86 @@ class MessageModule(nn.Module):
         x = torch.cat([src_mem, dst_mem, edge_feat, delta_t], dim=1)
         return self.mlp(x)
 
-# EmbeddingModule 
+
 class EmbeddingModule(nn.Module):
     def __init__(self, memory_dim, embed_dim):
         super().__init__()
-        self.sage = SAGEConv(memory_dim, embed_dim)
-        self.norm = nn.LayerNorm(embed_dim)
-        self.fallback = nn.Linear(memory_dim, embed_dim, bias=False) 
+        self.sage     = SAGEConv(memory_dim, embed_dim)
+        self.norm     = nn.LayerNorm(embed_dim)
+        self.fallback = nn.Linear(memory_dim, embed_dim, bias=False)
 
     def forward(self, x, edge_index):
         if edge_index.shape[1] == 0:
             return F.relu(self.fallback(x))
-        out = self.sage(x, edge_index)
-        return self.norm(F.relu(out))
+        return self.norm(F.relu(self.sage(x, edge_index)))
+
 
 class TGN(nn.Module):
     def __init__(self, num_nodes, memory_dim=64, message_dim=64,
-                 embed_dim=64, edge_feat_dim=6, num_classes=3, dropout=0.3):
+                 embed_dim=64, edge_feat_dim=6, dropout=0.3):
         super().__init__()
-        self.num_nodes  = num_nodes   # ← simpan untuk global_to_local
+        self.num_nodes  = num_nodes
         self.memory_dim = memory_dim
         self.memory     = MemoryModule(num_nodes, memory_dim)
         self.message    = MessageModule(memory_dim, edge_feat_dim, message_dim)
         self.embedding  = EmbeddingModule(memory_dim, embed_dim)
 
+        # Hanya satu head: anomaly score
         self.anomaly_head = nn.Sequential(
             nn.Linear(embed_dim * 2, embed_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim, 1),
         )
-        self.class_head = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, num_classes),
-        )
 
     def forward(self, src_ids, dst_ids, edge_feat, timestamps, edge_index):
-        # 1. Node aktif dalam batch ini 
         all_active     = torch.unique(torch.cat([src_ids, dst_ids]))
         all_active_cpu = all_active.cpu()
 
-        # 2. Tensor mapping: global_id → local_id 
-        global_to_local = torch.full(
-            (self.num_nodes,), -1, dtype=torch.long
-        )
+        global_to_local = torch.full((self.num_nodes,), -1, dtype=torch.long)
         global_to_local[all_active_cpu] = torch.arange(len(all_active), dtype=torch.long)
         global_to_local = global_to_local.to(src_ids.device)
 
-        # 3. Filter & remap edge_index ke local 
         src_ei, dst_ei = edge_index[0], edge_index[1]
-        src_local_ei   = global_to_local[src_ei]
-        dst_local_ei   = global_to_local[dst_ei]
-        valid_ei       = (src_local_ei >= 0) & (dst_local_ei >= 0)
-        local_ei       = torch.stack(
-            [src_local_ei[valid_ei], dst_local_ei[valid_ei]], dim=0
-        )
+        src_l_ei = global_to_local[src_ei]
+        dst_l_ei = global_to_local[dst_ei]
+        valid_ei = (src_l_ei >= 0) & (dst_l_ei >= 0)
+        local_ei = torch.stack([src_l_ei[valid_ei], dst_l_ei[valid_ei]], dim=0)
 
-        # 4. Subset memory ke node aktif 
         sub_memory = self.memory.memory[all_active_cpu].to(src_ids.device)
-
-        # 5. Memory & message (tetap pakai global ids)
-        src_mem  = self.memory.get_memory(src_ids)
-        dst_mem  = self.memory.get_memory(dst_ids)
-        last_t   = self.memory.last_update[src_ids].float()
-        delta_t  = (timestamps.float() - last_t).clamp(min=0)
-        messages = self.message(src_mem, dst_mem, edge_feat, delta_t)
+        src_mem    = self.memory.get_memory(src_ids)
+        dst_mem    = self.memory.get_memory(dst_ids)
+        last_t     = self.memory.last_update[src_ids].float()
+        delta_t    = (timestamps.float() - last_t).clamp(min=0)
+        messages   = self.message(src_mem, dst_mem, edge_feat, delta_t)
 
         self.memory.update_memory(src_ids, messages)
         self.memory.update_memory(dst_ids, messages)
         self.memory.last_update[src_ids] = timestamps
         self.memory.last_update[dst_ids] = timestamps
 
-        # 6. Embedding hanya node aktif 
-        node_emb_active = self.embedding(sub_memory, local_ei)
-
-        # 7. Remap src/dst ke local index 
+        node_emb  = self.embedding(sub_memory, local_ei)
         src_local = global_to_local[src_ids]
         dst_local = global_to_local[dst_ids]
+        edge_emb  = torch.cat([node_emb[src_local], node_emb[dst_local]], dim=1)
 
-        edge_emb      = torch.cat(
-            [node_emb_active[src_local], node_emb_active[dst_local]], dim=1
-        )
-        anomaly_logit = self.anomaly_head(edge_emb).squeeze(1)
-        class_logit   = self.class_head(edge_emb)
-        return anomaly_logit, class_logit
+        # Return langsung anomaly score — tidak ada class logit
+        return self.anomaly_head(edge_emb).squeeze(1)
 
     def detach_memory(self):
         self.memory.memory = self.memory.memory.detach()
 
 ------------------------------------------------------------
-Cell 22 - Initialize Model:
+Cell 19 - Initialize Model:
 
-node_df  = pd.read_parquet("./parsed/node_map.parquet")
-node_map = dict(zip(node_df["name"], node_df["node_id"]))
-NUM_NODES = len(node_map)
-print(f"NUM_NODES: {NUM_NODES:,}")
-
-split_cfg    = pd.read_parquet("./parsed/split_config.parquet").iloc[0]
-TS_MIN       = int(split_cfg["ts_min"])
-TS_TRAIN_END = int(split_cfg["ts_train_end"])
-TS_VAL_END   = int(split_cfg["ts_val_end"])
-TS_MAX       = int(split_cfg["ts_max"])
+n_train_attack = 0
+n_train_normal = 0
+for batch in pq.ParquetFile("./parsed/auth_edges_sampled.parquet").iter_batches(
+        batch_size=5_000_000, columns=["timestamp","label"]):
+    df = batch.to_pandas()
+    mask = df["timestamp"] < TS_TRAIN_END
+    n_train_attack += int(df.loc[mask, "label"].sum())
+    n_train_normal += int((df.loc[mask, "label"] == 0).sum())
 
 model = TGN(
     num_nodes     = NUM_NODES,
@@ -938,83 +719,28 @@ model = TGN(
     message_dim   = MEMORY_DIM,
     embed_dim     = EMBED_DIM,
     edge_feat_dim = EDGE_FEAT_DIM,
-    num_classes   = NUM_CLASSES,
     dropout       = 0.3,
 ).to(DEVICE)
 
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-
-    def forward(self, logits, targets):
-        bce  = F.binary_cross_entropy_with_logits(
-                   logits, targets.float(), reduction="none")
-        pt   = torch.exp(-bce)
-        loss = self.alpha * (1 - pt) ** self.gamma * bce
-        return loss.mean()
-
-
-# PERBAIKAN 1: Hapus FocalLoss yang tidak dipakai
-# PERBAIKAN 2: pos_weight dari proporsi training set, bukan test set
-# Dari Cell 27: train ~50 attacks, sisanya normal
-# Hitung dulu jumlah normal di training split
-pf_tmp = pq.ParquetFile("./parsed/auth_edges_sampled.parquet")
-n_train_normal = 0
-n_train_attack = 0
-for batch in pf_tmp.iter_batches(batch_size=5_000_000, columns=["timestamp","label"]):
-    df_tmp = batch.to_pandas()
-    mask   = df_tmp["timestamp"] < TS_TRAIN_END
-    n_train_normal += int((df_tmp[mask]["label"] == 0).sum())
-    n_train_attack += int((df_tmp[mask]["label"] == 1).sum())
-    del df_tmp
-
-print(f"Train normal : {n_train_normal:,}")
-print(f"Train attack : {n_train_attack:,}")
-
-# pos_weight = berapa kali lebih banyak normal dibanding attack di training
+# Pos weight dari proporsi training
 pos_weight        = torch.tensor([n_train_normal / max(n_train_attack, 1)], device=DEVICE)
 criterion_anomaly = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-print(f"pos_weight   : {pos_weight.item():.1f}x")
-
-# PERBAIKAN 3: class weights proporsional ke distribusi nyata di test set
-# Recon: 14, Lateral: 35, Persistence: 30  (total 79)
-_class_weights = torch.tensor([
-    79.0 / 14,   # Recon       → 5.64
-    79.0 / 35,   # Lateral     → 2.26
-    79.0 / 30,   # Persistence → 2.63
-])
-
-def get_criterion_class(device=DEVICE):
-    return nn.CrossEntropyLoss(weight=_class_weights.to(device))
-
-criterion_class = get_criterion_class(DEVICE)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode="min", patience=3, factor=0.5
+    optimizer, mode="max", patience=3, factor=0.5  # mode=max karena monitor AUROC
 )
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Model siap di  : {DEVICE}")
-print(f"Total parameter: {total_params:,}")
-print(f"best_thresh    : {best_thresh}  (default, akan di-update setelah eval)")
+best_thresh = 0.5
+print(f"Model siap: {sum(p.numel() for p in model.parameters()):,} params")
+print(f"pos_weight: {pos_weight.item():.1f}x")
 
 ------------------------------------------------------------
-# Cell 23 - Stratified Temporal Sampling
+Cell 20 - Stratified Temporal Sampling:
 
 # normal_ratio dinaikkan ke 0.10 karena:
 # - Train window pendek (7 hari), perlu lebih banyak data per hari
 # - Total dataset tetap manageable
-
-import pyarrow.parquet as pq
-import pyarrow as pa
-import pandas as pd
-import numpy as np
-import gc
-from pathlib import Path
 
 def create_stratified_sample_v2(
     output_dir    = "./parsed",
@@ -1130,9 +856,7 @@ for fname in ["auth_edges_sampled.parquet", "auth_feats_sampled.parquet"]:
 create_stratified_sample_v2()
 
 ------------------------------------------------------------
-Cell 24 - Pre-Index Training (untuk file sampled):
-
-import numpy as np
+Cell 21 - Pre-Index Training (untuk file sampled):
 
 pf = pq.ParquetFile("./parsed/auth_edges_sampled.parquet")
 metadata = pf.metadata
@@ -1177,71 +901,58 @@ print(f"\nIndex dibangun: {len(batch_index_df)} row groups")
 print(batch_index_df.head(10).to_string())
 
 ------------------------------------------------------------
-Cell 25 - Load Window:
+Cell 22 - Load Window:
 
-batch_index_df = pd.read_parquet("./parsed/batch_index.parquet")
- 
 def load_window_fast(ts_start, ts_end, batch_size=BATCH_SIZE):
     pf_e = pq.ParquetFile("./parsed/auth_edges_sampled.parquet")
     pf_f = pq.ParquetFile("./parsed/auth_feats_sampled.parquet")
- 
+
     relevant = batch_index_df[
         (batch_index_df["ts_max"] >= ts_start) &
         (batch_index_df["ts_min"] <  ts_end)
     ]
     if relevant.empty:
         return
- 
+
     for _, row in relevant.iterrows():
         rg_num = int(row["rg_num"])
         df_e = pf_e.read_row_group(rg_num).to_pandas()
         df_f = pf_f.read_row_group(rg_num).to_pandas()
- 
+
         mask = (df_e["timestamp"] >= ts_start) & (df_e["timestamp"] < ts_end)
         df_e = df_e[mask].reset_index(drop=True)
         df_f = df_f[mask].reset_index(drop=True)
- 
+
         if len(df_e) == 0:
             del df_e, df_f
             continue
- 
+
         window_ei = torch.stack([
             torch.tensor(df_e["src_id"].values, dtype=torch.long),
             torch.tensor(df_e["dst_id"].values, dtype=torch.long),
         ], dim=0).to(DEVICE)
- 
+
         for start in range(0, len(df_e), batch_size):
             end = min(start + batch_size, len(df_e))
             be_ = df_e.iloc[start:end]
             bf_ = df_f.iloc[start:end]
- 
-            # Bug 6 fix: attack_class di-shift -1 saat di-yield
-            # Storage: 0=normal, 1=Recon, 2=Lateral, 3=Persist
-            # Head input: 0=Recon, 1=Lateral, 2=Persist  (class-1)
-            # Hanya attack events (label==1) yang masuk class head,
-            # jadi attack_class==0 (normal) tidak pernah terpakai di head.
-            # Shift dilakukan di sini agar konsisten.
-            raw_cls = be_["attack_class"].values.copy()
-            # Shift: 1→0, 2→1, 3→2. Normal (0) dibiarkan 0 (tidak masuk head)
-            shifted_cls = np.where(raw_cls > 0, raw_cls - 1, 0).astype(np.int64)
- 
+
             yield (
                 torch.tensor(be_["src_id"].values,    dtype=torch.long).to(DEVICE),
                 torch.tensor(be_["dst_id"].values,    dtype=torch.long).to(DEVICE),
                 torch.tensor(bf_.values,              dtype=torch.float32).to(DEVICE),
                 torch.tensor(be_["timestamp"].values, dtype=torch.long).to(DEVICE),
                 torch.tensor(be_["label"].values,     dtype=torch.long).to(DEVICE),
-                torch.tensor(shifted_cls,             dtype=torch.long).to(DEVICE),
                 window_ei,
             )
- 
+
         del df_e, df_f, window_ei
         gc.collect()
 
 ------------------------------------------------------------
-# Cell 26 - Training Estimation Loop
+Cell 23 - Training Estimation Loop
 
-n_train_windows = (TS_TRAIN_END - TS_MIN) // WINDOW_SIZE   # Bug 2 fix: TS_MIN bukan 0
+n_train_windows = (TS_TRAIN_END - TS_MIN) // WINDOW_SIZE 
 n_val_windows   = (TS_VAL_END - TS_TRAIN_END) // WINDOW_SIZE
  
 print(f"Train windows : {n_train_windows} hari")
@@ -1260,11 +971,22 @@ model.train()
 model.memory.reset_memory()
  
 batch_times = []
-# Bug 2 fix: pakai TS_MIN bukan 0
-for src, dst, feat, ts, lbl, cls, ei in load_window_fast(TS_MIN, TS_MIN + WINDOW_SIZE):
+
+for src, dst, feat, ts, lbl, ei in load_window_fast(TS_MIN, TS_MIN + WINDOW_SIZE):
     t0 = time.time()
     with torch.set_grad_enabled(True):
-        ano_logit, cls_logit = model(src, dst, feat, ts, ei)
+        for src, dst, feat, ts, lbl, ei in load_window_fast(TS_MIN, TS_MIN + WINDOW_SIZE):
+            t0 = time.time()
+            with torch.set_grad_enabled(True):
+                ano_logit = model(src, dst, feat, ts, ei)   # ← hapus cls_logit
+                loss = criterion_anomaly(ano_logit, lbl.float())  # ← tambah .float()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.detach_memory()
+            batch_times.append(time.time() - t0)
+            if len(batch_times) >= 5:
+                break
         loss = criterion_anomaly(ano_logit, lbl)
     optimizer.zero_grad()
     loss.backward()
@@ -1292,14 +1014,9 @@ if batch_times:
         print("  PERINGATAN: CPU training. Pertimbangkan GPU atau aktifkan CUDA.")
 
 ------------------------------------------------------------
-# Cell 27 - Train Split Attack Check
+Cell 24 - Train Split Attack Check
 
 # Analisis representasi sampling sebelum memutuskan ratio
-
-import pyarrow.parquet as pq
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
 
 # 1. Cek distribusi temporal — apakah tiap hari terwakili?
 pf = pq.ParquetFile("./parsed/auth_edges_sampled.parquet")
@@ -1426,7 +1143,7 @@ print(f"  Attack ratio    : {702/est_rows*100:.4f}%  (vs sekarang {702/total_sam
 print(f"  Avg rows/hari   : {est_rows/58:,.0f}  (vs sekarang {total_samp/58:,.0f})")
 
 ------------------------------------------------------------
-# Cell 28 - Distribution Attack Check
+Cell 25 - Distribution Attack Check
 
 # Cek distribusi attack per hari secara detail
 
@@ -1459,336 +1176,190 @@ print(f"TS_MAX       = hari ke-{TS_MAX        // 86400}")
 
 
 ------------------------------------------------------------
-# Cell 29 - Training Loop
+# Cell 26 - Training Loop
 
-import time
-from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
-import numpy as np
- 
-EPOCHS        = 10
-PATIENCE      = 3
+EPOCHS         = 10
+PATIENCE       = 3
 best_val_auroc = 0.0
-patience_ctr  = 0
- 
-# Nama kelas untuk logging (head output 0,1,2 → nama)
-HEAD_CLASS_NAMES = {0: "Recon", 1: "Lateral", 2: "Persistence"}
- 
+patience_ctr   = 0
+
 def run_epoch(split="train", epoch=0):
     is_train = (split == "train")
     model.train() if is_train else model.eval()
- 
+
     if is_train:
         model.memory.reset_memory()
- 
-    if split == "train":
-        ts_start, ts_end = TS_MIN, TS_TRAIN_END
-    elif split == "val":
-        ts_start, ts_end = TS_TRAIN_END, TS_VAL_END
-    else:
-        ts_start, ts_end = TS_VAL_END, TS_MAX
- 
-    total_loss     = 0.0
-    total_loss_ano = 0.0
-    total_loss_cls = 0.0
-    n_batches      = 0
- 
-    all_labels     = []
-    all_ano_probs  = []
-    all_cls_preds  = []
-    all_cls_labels = []
- 
-    windows = list(range(ts_start, ts_end, WINDOW_SIZE))
-    t_epoch = time.time()
- 
+
+    ts_start, ts_end = {
+        "train": (TS_MIN, TS_TRAIN_END),
+        "val"  : (TS_TRAIN_END, TS_VAL_END),
+        "test" : (TS_VAL_END, TS_MAX),
+    }[split]
+
+    total_loss    = 0.0
+    n_batches     = 0
+    all_labels    = []
+    all_probs     = []
+    t_epoch       = time.time()
+    windows       = list(range(ts_start, ts_end, WINDOW_SIZE))
+
     for w_idx, w_start in enumerate(windows):
-        w_end = w_start + WINDOW_SIZE
- 
-        for src, dst, feat, ts, lbl, cls, ei in load_window_fast(w_start, w_end):
-            src  = src.to(DEVICE)
-            dst  = dst.to(DEVICE)
-            feat = feat.to(DEVICE)
-            ts   = ts.to(DEVICE)
-            lbl  = lbl.to(DEVICE)
-            cls  = cls.to(DEVICE)  # sudah 0-indexed (0=Recon,1=Lateral,2=Persist)
-            ei   = ei.to(DEVICE)
- 
+        for src, dst, feat, ts, lbl, ei in load_window_fast(w_start, w_start + WINDOW_SIZE):
+
             with torch.set_grad_enabled(is_train):
-                ano_logit, cls_logit = model(src, dst, feat, ts, ei)
-                loss_ano = criterion_anomaly(ano_logit, lbl)
- 
-                attack_mask = (lbl == 1)
-                if attack_mask.sum() > 0:
-                    # Bug 6 fix: cls sudah 0-indexed, langsung masuk CrossEntropyLoss
-                    # tidak perlu shift lagi
-                    loss_cls = criterion_class(
-                        cls_logit[attack_mask], cls[attack_mask]
-                    )
-                    loss = loss_ano + 0.5 * loss_cls
-                else:
-                    loss_cls = torch.tensor(0.0, device=DEVICE)
-                    loss     = loss_ano
- 
+                ano_logit = model(src, dst, feat, ts, ei)
+                loss      = criterion_anomaly(ano_logit, lbl.float())
+
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 model.detach_memory()
- 
-            total_loss     += loss.item()
-            total_loss_ano += loss_ano.item()
-            total_loss_cls += loss_cls.item()
-            n_batches      += 1
- 
+
+            total_loss += loss.item()
+            n_batches  += 1
             all_labels.extend(lbl.cpu().numpy().tolist())
-            all_ano_probs.extend(
-                torch.sigmoid(ano_logit).detach().cpu().numpy().tolist()
-            )
-            if attack_mask.sum() > 0:
-                all_cls_preds.extend(
-                    cls_logit[attack_mask].argmax(dim=1).detach().cpu().numpy().tolist()
-                )
-                all_cls_labels.extend(cls[attack_mask].cpu().numpy().tolist())
- 
+            all_probs.extend(torch.sigmoid(ano_logit).detach().cpu().numpy().tolist())
+
         if (w_idx + 1) % 5 == 0 or (w_idx + 1) == len(windows):
-            elapsed  = time.time() - t_epoch
-            avg_loss = total_loss / max(n_batches, 1)
             log.info(
                 f"  [{split.upper()}] Epoch {epoch+1} | "
                 f"Window {w_idx+1}/{len(windows)} | "
-                f"Loss: {avg_loss:.4f} | "
-                f"Elapsed: {elapsed:.0f}s"
+                f"Loss: {total_loss/max(n_batches,1):.4f} | "
+                f"Elapsed: {time.time()-t_epoch:.0f}s"
             )
- 
-    avg_loss     = total_loss     / max(n_batches, 1)
-    avg_loss_ano = total_loss_ano / max(n_batches, 1)
-    avg_loss_cls = total_loss_cls / max(n_batches, 1)
- 
-    all_labels    = np.array(all_labels)
-    all_ano_probs = np.array(all_ano_probs)
- 
-    auroc = roc_auc_score(all_labels, all_ano_probs) \
+
+    all_labels = np.array(all_labels)
+    all_probs  = np.array(all_probs)
+
+    auroc = roc_auc_score(all_labels, all_probs) \
             if len(np.unique(all_labels)) > 1 else 0.0
- 
-    ano_preds = (all_ano_probs >= 0.5).astype(int)
-    f1_ano    = f1_score(all_labels, ano_preds, zero_division=0)
-    prec_ano  = precision_score(all_labels, ano_preds, zero_division=0)
-    rec_ano   = recall_score(all_labels, ano_preds, zero_division=0)
-    f1_cls    = f1_score(all_cls_labels, all_cls_preds,
-                         average="macro", zero_division=0) \
-                if len(all_cls_preds) > 0 else 0.0
- 
+
+    # Threshold search — penting untuk data imbalanced
+    best_thr, best_f1 = 0.5, 0.0
+    for thr in np.arange(0.05, 0.80, 0.01):
+        preds = (all_probs >= thr).astype(int)
+        f1    = f1_score(all_labels, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, thr
+
+    preds    = (all_probs >= best_thr).astype(int)
     return {
-        "loss"     : avg_loss,
-        "loss_ano" : avg_loss_ano,
-        "loss_cls" : avg_loss_cls,
-        "auroc"    : auroc,
-        "f1_ano"   : f1_ano,
-        "prec_ano" : prec_ano,
-        "rec_ano"  : rec_ano,
-        "f1_cls"   : f1_cls,
+        "loss"    : total_loss / max(n_batches, 1),
+        "auroc"   : auroc,
+        "f1"      : f1_score(all_labels, preds, zero_division=0),
+        "prec"    : precision_score(all_labels, preds, zero_division=0),
+        "rec"     : recall_score(all_labels, preds, zero_division=0),
+        "best_thr": best_thr,
     }
- 
- 
-# Main training loop
+
+
 history = {"train": [], "val": []}
- 
+
 for epoch in range(EPOCHS):
     t0 = time.time()
-    log.info(f"\n{'='*60}")
-    log.info(f"EPOCH {epoch+1}/{EPOCHS}")
-    log.info(f"{'='*60}")
- 
-    train_metrics = run_epoch("train", epoch)
-    history["train"].append(train_metrics)
+    log.info(f"\n{'='*60}\nEPOCH {epoch+1}/{EPOCHS}\n{'='*60}")
+
+    train_m = run_epoch("train", epoch)
+    history["train"].append(train_m)
     log.info(
-        f"[TRAIN] Loss: {train_metrics['loss']:.4f} | "
-        f"AUROC: {train_metrics['auroc']:.4f} | "
-        f"F1-ano: {train_metrics['f1_ano']:.4f} | "
-        f"F1-cls: {train_metrics['f1_cls']:.4f}"
+        f"[TRAIN] Loss:{train_m['loss']:.4f} | AUROC:{train_m['auroc']:.4f} | "
+        f"F1:{train_m['f1']:.4f} | P:{train_m['prec']:.4f} | R:{train_m['rec']:.4f} | "
+        f"thr:{train_m['best_thr']:.2f}"
     )
- 
-    val_metrics = run_epoch("val", epoch)
-    history["val"].append(val_metrics)
+
+    val_m = run_epoch("val", epoch)
+    history["val"].append(val_m)
     log.info(
-        f"[VAL]   Loss: {val_metrics['loss']:.4f} | "
-        f"AUROC: {val_metrics['auroc']:.4f} | "
-        f"F1-ano: {val_metrics['f1_ano']:.4f} | "
-        f"F1-cls: {val_metrics['f1_cls']:.4f}"
+        f"[VAL]   Loss:{val_m['loss']:.4f} | AUROC:{val_m['auroc']:.4f} | "
+        f"F1:{val_m['f1']:.4f} | P:{val_m['prec']:.4f} | R:{val_m['rec']:.4f} | "
+        f"thr:{val_m['best_thr']:.2f}"
     )
- 
-    scheduler.step(val_metrics["loss"])
- 
-    if val_metrics["auroc"] > best_val_auroc:
-        best_val_auroc = val_metrics["auroc"]
+
+    scheduler.step(val_m["auroc"])
+
+    if val_m["auroc"] > best_val_auroc:
+        best_val_auroc = val_m["auroc"]
+        best_thresh    = val_m["best_thr"]
         patience_ctr   = 0
         torch.save({
-            "epoch"       : epoch + 1,
-            "model_state" : model.state_dict(),
-            "optim_state" : optimizer.state_dict(),
-            "val_auroc"    : best_val_auroc,
-            "val_metrics" : val_metrics,
-            "best_thresh" : best_thresh,
+            "epoch"      : epoch + 1,
+            "model_state": model.state_dict(),
+            "optim_state": optimizer.state_dict(),
+            "val_auroc"  : best_val_auroc,
+            "val_metrics": val_m,
+            "best_thresh": best_thresh,
         }, "./parsed/best_model.pt")
-        log.info(f"  Best model disimpan (val_loss={best_val_auroc:.4f})")
+        log.info(f"  ✓ Best model disimpan — AUROC={best_val_auroc:.4f} | thresh={best_thresh:.2f}")
     else:
         patience_ctr += 1
         log.info(f"  Patience: {patience_ctr}/{PATIENCE}")
         if patience_ctr >= PATIENCE:
-            log.info("Early stopping triggered.")
+            log.info("Early stopping.")
             break
- 
-    log.info(f"Epoch {epoch+1} selesai dalam {time.time()-t0:.0f} detik")
- 
-log.info("\nTraining selesai.")
+
+    log.info(f"Epoch {epoch+1} selesai dalam {time.time()-t0:.0f}s")
 
 ------------------------------------------------------------
-# CELL 30 - Evaluation on Test Set:
+CELL 27 - Evaluation on Test Set:
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import (
-    classification_report, confusion_matrix,
-    roc_curve, auc, precision_recall_curve
-)
- 
-# Load best model
 checkpoint = torch.load("./parsed/best_model.pt", map_location=DEVICE)
 model.load_state_dict(checkpoint["model_state"])
 model.eval()
- 
-# Bug 5 fix: load best_thresh dari checkpoint jika ada, fallback ke global default
-best_thresh = checkpoint.get("best_thresh", best_thresh)
-log.info(f"best_thresh dari checkpoint: {best_thresh}")
- 
-log.info("Warm-up memory dengan val set sebelum evaluasi test...")
+best_thresh = checkpoint.get("best_thresh", 0.5)
+
+# Warm-up memory dengan val set
 model.memory.reset_memory()
 with torch.no_grad():
-    for src, dst, feat, ts, lbl, cls, ei in load_window_fast(TS_TRAIN_END, TS_VAL_END):
+    for src, dst, feat, ts, lbl, ei in load_window_fast(TS_TRAIN_END, TS_VAL_END):
         model(src, dst, feat, ts, ei)
-log.info("Warm-up selesai. Mulai evaluasi test set...")
- 
-all_labels     = []
-all_ano_probs  = []
-all_cls_preds  = []
-all_cls_labels = []
- 
+
+all_labels = []
+all_probs  = []
+
 with torch.no_grad():
-    for src, dst, feat, ts, lbl, cls, ei in load_window_fast(TS_VAL_END, TS_MAX):
-        ano_logit, cls_logit = model(src, dst, feat, ts, ei)
- 
+    for src, dst, feat, ts, lbl, ei in load_window_fast(TS_VAL_END, TS_MAX):
+        ano_logit = model(src, dst, feat, ts, ei)
         all_labels.extend(lbl.cpu().numpy().tolist())
-        all_ano_probs.extend(
-            torch.sigmoid(ano_logit).cpu().numpy().tolist()
-        )
- 
-        attack_mask = (lbl == 1)
-        if attack_mask.sum() > 0:
-            all_cls_preds.extend(
-                cls_logit[attack_mask].argmax(dim=1).cpu().numpy().tolist()
-            )
-            # Bug 6 fix: cls sudah 0-indexed dari load_window_fast
-            all_cls_labels.extend(cls[attack_mask].cpu().numpy().tolist())
- 
-all_labels    = np.array(all_labels)
-all_ano_probs = np.array(all_ano_probs)
- 
-# Bug 5 fix: best_thresh sudah punya nilai default 0.5
-if len(np.unique(all_labels)) < 2:
-    print("WARNING: Test set hanya 1 kelas — skip AUROC & threshold search.")
-    auroc = 0.0
-    # best_thresh tetap pakai nilai dari checkpoint atau default 0.5
-else:
-    thresholds = np.arange(0.1, 0.9, 0.02)
-    best_f1    = 0.0
-    for thr in thresholds:
-        preds = (all_ano_probs >= thr).astype(int)
-        f1    = f1_score(all_labels, preds, zero_division=0)
-        if f1 > best_f1:
-            best_f1     = f1
-            best_thresh = thr  # update global best_thresh
-    log.info(f"Threshold optimal: {best_thresh:.2f} (F1={best_f1:.4f})")
-    auroc = roc_auc_score(all_labels, all_ano_probs)
- 
-    # Bug 5 fix: Simpan best_thresh yang sudah di-update ke checkpoint
-    checkpoint["best_thresh"] = best_thresh
-    torch.save(checkpoint, "./parsed/best_model.pt")
-    log.info(f"best_thresh ({best_thresh:.2f}) disimpan ke checkpoint.")
- 
-ano_preds = (all_ano_probs >= best_thresh).astype(int)
- 
-print("\n" + "="*60)
+        all_probs.extend(torch.sigmoid(ano_logit).cpu().numpy().tolist())
+
+all_labels = np.array(all_labels)
+all_probs  = np.array(all_probs)
+preds      = (all_probs >= best_thresh).astype(int)
+
+print("="*60)
 print("ANOMALY DETECTION — Test Set")
 print("="*60)
 print(classification_report(
-    all_labels, ano_preds,
-    target_names=["Normal", "Attack"],
+    all_labels, preds,
+    target_names=["Normal", "Anomaly"],
     digits=4
 ))
-print(f"AUROC: {auroc:.4f}")
- 
-if len(all_cls_preds) > 0:
-    print("\n" + "="*60)
-    print("ATTACK CLASSIFICATION — Test Set (attack events only)")
-    print("="*60)
-    # Bug 6 fix: 3 kelas (0=Recon, 1=Lateral, 2=Persist), labels=[0,1,2]
-    print(classification_report(
-        all_cls_labels, all_cls_preds,
-        target_names=["Recon", "Lateral", "Persistence"],
-        labels=[0, 1, 2],
-        digits=4
-    ))
- 
-# Plot
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
- 
-if auroc > 0:
-    fpr, tpr, _ = roc_curve(all_labels, all_ano_probs)
-    axes[0].plot(fpr, tpr, lw=2, label=f"AUC = {auroc:.4f}")
-    axes[0].plot([0,1], [0,1], "k--", lw=0.8)
-else:
-    axes[0].text(0.5, 0.5, "Data tidak cukup\nuntuk ROC",
-                 ha="center", va="center", transform=axes[0].transAxes)
-axes[0].set_xlabel("False Positive Rate")
-axes[0].set_ylabel("True Positive Rate")
-axes[0].set_title("ROC Curve — Anomaly Detection")
+
+auroc = roc_auc_score(all_labels, all_probs)
+print(f"AUROC      : {auroc:.4f}")
+print(f"Threshold  : {best_thresh:.2f}")
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+fpr, tpr, _ = roc_curve(all_labels, all_probs)
+axes[0].plot(fpr, tpr, lw=2, label=f"AUC = {auroc:.4f}")
+axes[0].plot([0,1], [0,1], "k--", lw=0.8)
+axes[0].set(xlabel="FPR", ylabel="TPR", title="ROC Curve")
 axes[0].legend()
- 
-if auroc > 0:
-    prec, rec, _ = precision_recall_curve(all_labels, all_ano_probs)
-    pr_auc = auc(rec, prec)
-    axes[1].plot(rec, prec, lw=2, label=f"PR-AUC = {pr_auc:.4f}")
-    axes[1].legend()
-else:
-    axes[1].text(0.5, 0.5, "Data tidak cukup\nuntuk PR Curve",
-                 ha="center", va="center", transform=axes[1].transAxes)
-axes[1].set_xlabel("Recall")
-axes[1].set_ylabel("Precision")
-axes[1].set_title("Precision-Recall Curve")
- 
-if len(all_cls_preds) > 0:
-    # Bug 6 fix: confusion matrix 3x3, labels 0,1,2
-    cm = confusion_matrix(all_cls_labels, all_cls_preds, labels=[0,1,2])
-    sns.heatmap(
-        cm, annot=True, fmt="d", ax=axes[2], cmap="Blues",
-        xticklabels=["Recon","Lateral","Persist"],
-        yticklabels=["Recon","Lateral","Persist"],
-    )
-    axes[2].set_title("Confusion Matrix — Attack Class")
-    axes[2].set_ylabel("True")
-    axes[2].set_xlabel("Predicted")
-else:
-    axes[2].text(0.5, 0.5, "Tidak ada attack\ndi test set",
-                 ha="center", va="center", transform=axes[2].transAxes)
-    axes[2].set_title("Confusion Matrix — Attack Class")
- 
+
+prec, rec, _ = precision_recall_curve(all_labels, all_probs)
+axes[1].plot(rec, prec, lw=2, label=f"PR-AUC = {auc(rec, prec):.4f}")
+axes[1].set(xlabel="Recall", ylabel="Precision", title="Precision-Recall Curve")
+axes[1].legend()
+
 plt.tight_layout()
 plt.savefig("./parsed/evaluation_results.png", dpi=150, bbox_inches="tight")
 plt.show()
-print("Plot disimpan ke ./parsed/evaluation_results.png")
 
 ------------------------------------------------------------
-# CELL 31 - Save & Inference:
+# CELL 28 - Save & Inference:
 
 torch.save({
     "model_state"  : model.state_dict(),
@@ -1871,24 +1442,59 @@ def predict_log_batch(
     ei_t   = torch.stack([src_t, dst_t], dim=0)
  
     with torch.no_grad():
-        ano_logit, cls_logit = model(src_t, dst_t, feat_t, ts_t, ei_t)
- 
+        ano_logit = model(src_t, dst_t, feat_t, ts_t, ei_t)  # ← 1 output saja
+
     ano_scores = torch.sigmoid(ano_logit).cpu().numpy()
     is_anomaly = (ano_scores >= threshold).astype(int)
-    cls_preds  = cls_logit.argmax(dim=1).cpu().numpy()  # 0=Recon, 1=Lateral, 2=Persist
- 
+
+    # Karena tidak ada class head, klasifikasi pakai heuristik sederhana
+    # berdasarkan pola koneksi di batch ini
     src_arr = np.array(src_computers)[valid_mask]
     dst_arr = np.array(dst_computers)[valid_mask]
- 
+
+    def classify_attack_heuristic(src_arr, dst_arr, is_anomaly):
+        """
+        Rule-based fallback karena model tidak punya class head.
+        - Reconnaissance : satu src → banyak dst unik
+        - Lateral Movement: src berganti-ganti (berpindah mesin)
+        - Persistence     : src dan dst sama berulang
+        """
+        from collections import Counter
+        cls_preds = []
+        src_dst_count = Counter(zip(src_arr, dst_arr))
+
+        for i, (s, d, is_atk) in enumerate(zip(src_arr, dst_arr, is_anomaly)):
+            if not is_atk:
+                cls_preds.append(-1)  # Normal, tidak diklasifikasi
+                continue
+
+            # Hitung berapa banyak dst unik dari src ini
+            dst_from_src = [dst for src, dst in zip(src_arr, dst_arr) if src == s]
+            unique_dst = len(set(dst_from_src))
+
+            # Hitung berapa kali pasangan (src, dst) ini muncul
+            repeat_count = src_dst_count[(s, d)]
+
+            if unique_dst >= 3:
+                cls_preds.append(0)  # Reconnaissance — sebar ke banyak target
+            elif repeat_count >= 3:
+                cls_preds.append(2)  # Persistence — koneksi berulang ke target sama
+            else:
+                cls_preds.append(1)  # Lateral Movement — default
+        
+        return np.array(cls_preds)
+
+    cls_preds = classify_attack_heuristic(src_arr, dst_arr, is_anomaly)
+
     result = pd.DataFrame({
         "src_computer"     : src_arr,
         "dst_computer"     : dst_arr,
         "timestamp"        : timestamps_v,
         "anomaly_score"    : ano_scores,
         "is_anomaly"       : is_anomaly,
-        "attack_class"     : cls_preds,                    # 0,1,2 (head output)
+        "attack_class"     : cls_preds,
         "attack_class_name": [
-            CLASS_NAMES[c] if a else "Normal"
+            CLASS_NAMES[c] if (a and c >= 0) else "Normal"
             for c, a in zip(cls_preds, is_anomaly)
         ],
     })
