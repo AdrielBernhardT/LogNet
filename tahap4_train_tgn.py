@@ -5,6 +5,9 @@ from torch_geometric.loader import TemporalDataLoader
 from torch_geometric.nn import TGNMemory
 from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator
 
+# ==========================================
+# 1. PERSIAPAN PERANGKAT & DATA
+# ==========================================
 print("1. Menyiapkan Perangkat dan Data...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Menggunakan Device: {device}")
@@ -17,19 +20,28 @@ data = TemporalData(
 
 train_loader = TemporalDataLoader(data, batch_size=2000)
 
+# ==========================================
+# 2. WEIGHTED LOSS (MENGATASI IMBALANCE)
+# ==========================================
 jumlah_normal = (data.y == 0).sum().item()
 jumlah_serangan = (data.y == 1).sum().item()
 pos_weight_value = torch.tensor([jumlah_normal / jumlah_serangan], device=device)
 criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_value)
 
+print(f"-> Bobot Hukuman untuk Serangan: {pos_weight_value.item():.2f}x lipat lebih berat")
+
+# ==========================================
+# 3. MERAKIT MODEL TGN
+# ==========================================
 print("\n3. Merakit Model TGN...")
 memory_dim = 100
 time_dim = 100
 num_nodes = max(data.src.max(), data.dst.max()).item() + 1
 
+# raw_msg_dim otomatis membaca 5 kolom fitur dari V4
 memory = TGNMemory(
     num_nodes=num_nodes, 
-    raw_msg_dim=data.msg.size(1), # Sekarang otomatis menyesuaikan jadi 3
+    raw_msg_dim=data.msg.size(1), 
     memory_dim=memory_dim, time_dim=time_dim,
     message_module=IdentityMessage(data.msg.size(1), memory_dim, time_dim),
     aggregator_module=LastAggregator()
@@ -50,11 +62,14 @@ class LinkPredictor(torch.nn.Module):
 link_pred = LinkPredictor(in_channels=memory_dim).to(device)
 optimizer = torch.optim.Adam(set(memory.parameters()) | set(link_pred.parameters()), lr=0.0001)
 
-print("\n4. Memulai Training (3 EPOCH)...")
+# ==========================================
+# 4. TRAINING LOOP (5 EPOCH)
+# ==========================================
+print("\n4. Memulai Training (5 EPOCH - Mode Detektif Forensik)...")
 memory.train()
 link_pred.train()
 
-for epoch in range(3): 
+for epoch in range(5): 
     memory.reset_state() 
     total_loss = 0
     
@@ -62,7 +77,8 @@ for epoch in range(3):
         optimizer.zero_grad()
         batch = batch.to(device)
         
-        memory.detach() # Mencegah Error Autograd
+        # Mencegah error backward graph (Error Autograd)
+        memory.detach() 
         
         z_src, _ = memory(batch.src)
         z_dst, _ = memory(batch.dst)
@@ -82,4 +98,4 @@ for epoch in range(3):
 
 torch.save(memory.state_dict(), 'tgn_memory_model.pth')
 torch.save(link_pred.state_dict(), 'tgn_predictor_model.pth')
-print("Model Sakti berhasil disimpan!")
+print("Model Detektif Forensik berhasil disimpan!")
