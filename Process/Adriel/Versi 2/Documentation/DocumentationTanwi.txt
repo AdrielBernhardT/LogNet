@@ -2,143 +2,228 @@
 TAHAP 1
 =============================================
 import pandas as pd
-import gzip
 import gc
+import os
 
 # ==========================================
 # KONFIGURASI FILE
 # ==========================================
-AUTH_FILE = 'Resources/auth.txt.gz'
-REDTEAM_FILE = 'Resources/redteam.txt.gz'
-OUTPUT_FILE = 'auth_sampled_balanced.parquet'
-CHUNK_SIZE = 2000000
+AUTH_FILE    = '../../Dataset RM/pick/auth.txt.gz'
+REDTEAM_FILE = '../../Dataset RM/pick/redteam.txt.gz'
+OUTPUT_FILE  = '../../parsed/auth_sampled_balanced.parquet'
+CHUNK_SIZE   = 2_000_000
+
+os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
 print("1. Membaca data Redteam (Kunci Jawaban)...")
+ 
 redteam_cols = ['time', 'user_domain', 'src_comp', 'dst_comp']
 df_redteam = pd.read_csv(REDTEAM_FILE, header=None, names=redteam_cols)
-
+ 
 redteam_signatures = set(
     zip(df_redteam['time'], df_redteam['user_domain'], df_redteam['src_comp'], df_redteam['dst_comp'])
 )
 del df_redteam
 gc.collect()
+ 
+print(f"   Total signature serangan unik: {len(redteam_signatures):,}")
 
-print(f"Total signature serangan unik: {len(redteam_signatures)}")
-print("\n2. Memproses Log Auth (Mode Detektif Forensik)...")
-
-auth_cols = ['time', 'src_user', 'dst_user', 'src_comp', 'dst_comp', 'auth_type', 'logon_type', 'orientation', 'success']
-
-chunks_processed = 0
-all_sampled_chunks = []
+print("\n2. Memproses Log Auth...")
+ 
+auth_cols = [
+    'time', 'src_user', 'dst_user', 'src_comp', 'dst_comp',
+    'auth_type', 'logon_type', 'orientation', 'success'
+]
+ 
+chunks_processed    = 0
+total_rows_read     = 0  # FIX 6: tracking baris aktual, bukan estimasi
+all_sampled_chunks  = []
 
 for chunk in pd.read_csv(AUTH_FILE, header=None, names=auth_cols, chunksize=CHUNK_SIZE):
-    chunk_signatures = list(zip(chunk['time'], chunk['src_user'], chunk['src_comp'], chunk['dst_comp']))
+    chunk_signatures = list(
+        zip(chunk['time'], chunk['src_user'], chunk['src_comp'], chunk['dst_comp'])
+    )
+    
     chunk['label'] = [1 if sig in redteam_signatures else 0 for sig in chunk_signatures]
-    
-    # EKSTRAKSI FITUR SAKTI V4
+
     chunk['is_success'] = (chunk['success'] == 'Success').astype(int)
-    
-    # Deteksi Manusia vs Mesin (Jika user berakhiran '$', berarti mesin)
+
     chunk['is_machine'] = chunk['src_user'].astype(str).str.endswith('$').astype(int)
-    
-    # Ekstraksi Logon Type (Ubah ke angka, jika aneh/kosong jadikan -1)
-    chunk['logon_type'] = pd.to_numeric(chunk['logon_type'], errors='coerce').fillna(-1).astype(float)
-    
-    attack_data = chunk[chunk['label'] == 1]
-    normal_data = chunk[chunk['label'] == 0]
-    
-    # Undersampling Normal
-    sampled_normal = normal_data.sample(frac=0.01, random_state=42)
-    
-    combined_chunk = pd.concat([attack_data, sampled_normal])
-    
-    # Simpan semua fitur baru
-    combined_chunk = combined_chunk[['time', 'src_user', 'dst_comp', 'is_success', 'is_machine', 'logon_type', 'label']]
+
+    chunk['logon_type'] = (
+        pd.to_numeric(chunk['logon_type'], errors='coerce')
+        .fillna(-1)
+        .astype(int)
+    )
+
+    attack_data = chunk[chunk['label'] == 1].copy()
+    normal_data = chunk[chunk['label'] == 0].copy()
+
+    if len(normal_data) > 0:
+        sampled_normal = normal_data.sample(frac=0.01, random_state=42)
+    else:
+        sampled_normal = normal_data.copy()
+ 
+    combined_chunk = pd.concat([attack_data, sampled_normal], ignore_index=True)
+
+    combined_chunk = combined_chunk[[
+        'time', 'src_user', 'src_comp', 'dst_comp',
+        'is_success', 'is_machine', 'logon_type', 'label'
+    ]]
+
     all_sampled_chunks.append(combined_chunk)
-    
+
+    total_rows_read += len(chunk)
     chunks_processed += 1
-    print(f"Selesai memproses chunk ke-{chunks_processed} ({(chunks_processed * 2)} Juta baris)")
-    
+    print(
+        f"   Chunk {chunks_processed:>3} selesai | "
+        f"Dibaca: {total_rows_read:>12,} baris | "
+        f"Attack: {len(attack_data):>5,} | "
+        f"Normal sampled: {len(sampled_normal):>7,}"
+    )
+ 
     del chunk, attack_data, normal_data, sampled_normal, combined_chunk
     gc.collect()
 
 print("\n3. Menyimpan hasil akhir...")
-final_df = pd.concat(all_sampled_chunks, ignore_index=True)
+if not all_sampled_chunks:
+    print("ERROR: Tidak ada data yang berhasil diproses.")
+    print("       Periksa path file:")
+    print(f"       AUTH_FILE    = {AUTH_FILE}")
+    print(f"       REDTEAM_FILE = {REDTEAM_FILE}")
+else:
+    final_df = pd.concat(all_sampled_chunks, ignore_index=True)
 
-print("\n=== RINGKASAN DATASET BARU (V4) ===")
-print(f"Total Serangan (Label 1) : {len(final_df[final_df['label'] == 1])}")
-print(f"Total Mesin (Label 1)    : {len(final_df[final_df['is_machine'] == 1])}")
-print(f"Total Manusia (Label 0)  : {len(final_df[final_df['is_machine'] == 0])}")
-
-final_df.to_parquet(OUTPUT_FILE, index=False)
-print(f"File berhasil disimpan di: {OUTPUT_FILE}")
+    total         = len(final_df)
+    total_attack  = (final_df['label'] == 1).sum()
+    total_normal  = (final_df['label'] == 0).sum()
+    total_machine = (final_df['is_machine'] == 1).sum()
+    total_human   = (final_df['is_machine'] == 0).sum()
+ 
+    print("\n=== RINGKASAN DATASET BARU (V4) ===")
+    print(f"Total baris              : {total:>12,}")
+    print(f"--- Label ---")
+    print(f"  Serangan  (label=1)    : {total_attack:>12,}  ({total_attack/total*100:.2f}%)")
+    print(f"  Normal    (label=0)    : {total_normal:>12,}  ({total_normal/total*100:.2f}%)")
+    print(f"--- Tipe Akun ---")
+    print(f"  Mesin     (is_machine=1): {total_machine:>11,}  ({total_machine/total*100:.2f}%)")
+    print(f"  Manusia   (is_machine=0): {total_human:>11,}  ({total_human/total*100:.2f}%)")
+ 
+    final_df.to_parquet(OUTPUT_FILE, index=False)
+    print(f"\nFile berhasil disimpan di: {OUTPUT_FILE}")
 
 =============================================
 TAHAP 2
 =============================================
 import pandas as pd
-import json
 import gc
+import json
+import os
 
-AUTH_PARQUET = 'auth_sampled_balanced.parquet'
-FLOWS_FILE = 'Resources/flows.txt.gz'
-OUT_EDGES = 'graph_edges.parquet'
-OUT_NODEMAP = 'node_map.json'
+# ==========================================
+# KONFIGURASI FILE
+# ==========================================
+AUTH_PARQUET = '../../parsed/auth_sampled_balanced.parquet' 
+FLOWS_FILE   = '../../Dataset RM/pick/flows.txt.gz'
+REDTEAM_FILE = '../../Dataset RM/pick/redteam.txt.gz'
+OUT_EDGES    = '../../graphs/graph_edges.parquet'
+OUT_NODEMAP  = '../../graphs/node_map.json'
+
+os.makedirs(os.path.dirname(OUT_EDGES), exist_ok=True)
 
 print("1. Memuat data Auth...")
 df_auth = pd.read_parquet(AUTH_PARQUET)
 
 df_auth_graph = pd.DataFrame({
-    'time': df_auth['time'],
-    'src_node': df_auth['src_user'], 
-    'dst_node': df_auth['dst_comp'],
-    'edge_type': 0,                   
-    'is_success': df_auth['is_success'],
-    'is_machine': df_auth['is_machine'],
-    'logon_type': df_auth['logon_type'],
-    'label': df_auth['label']         
+    'time'       : df_auth['time'],
+    'src_node'   : df_auth['src_user'],
+    'dst_node'   : df_auth['dst_comp'],
+    'edge_type'  : 0,
+    'auth_type'  : df_auth['auth_type'],      
+    'is_success' : df_auth['is_success'],
+    'is_machine' : df_auth['is_machine'],
+    'logon_type' : df_auth['logon_type'],
+    'label'      : df_auth['label']
 })
 del df_auth
 gc.collect()
 
 print("2. Memuat sampel data Flows...")
-flow_cols = ['time', 'duration', 'src_comp', 'src_port', 'dst_comp', 'dst_port', 'protocol', 'packet_count', 'byte_count']
-df_flow_raw = pd.read_csv(FLOWS_FILE, header=None, names=flow_cols, nrows=500000)
-
+flow_cols = [
+    'time', 'duration', 'src_comp', 'src_port',
+    'dst_comp', 'dst_port', 'protocol', 'packet_count', 'byte_count'
+]
+df_flow_raw = pd.read_csv(
+    FLOWS_FILE, header=None, names=flow_cols, nrows=500_000
+)
+ 
 df_flow_graph = pd.DataFrame({
-    'time': df_flow_raw['time'],
-    'src_node': df_flow_raw['src_comp'],
-    'dst_node': df_flow_raw['dst_comp'],
-    'edge_type': 1,                   
-    'is_success': 1,                  
-    'is_machine': 1,   # Flow jaringan mayoritas komunikasi mesin ke mesin               
-    'logon_type': -1,  # Flow tidak memiliki tipe logon
-    'label': 0                        
+    'time'       : df_flow_raw['time'],
+    'src_node'   : df_flow_raw['src_comp'],
+    'dst_node'   : df_flow_raw['dst_comp'],
+    'edge_type'  : 1,          # 1 = flow event
+    'auth_type'  : 'N/A',      # Flow tidak memiliki auth_type
+    'is_success' : 1,
+    'is_machine' : 1,          # Flow = komunikasi mesin ke mesin
+    'logon_type' : -1,         # Flow tidak memiliki logon type
+    'label'      : 0
 })
 del df_flow_raw
 gc.collect()
 
 print("3. Menggabungkan Auth dan Flows...")
 df_graph = pd.concat([df_auth_graph, df_flow_graph], ignore_index=True)
-df_graph = df_graph.sort_values('time').reset_index(drop=True)
+df_graph = df_graph.sort_values('time').reset_index(drop=True)\
 
-print("4. Membuat Node Mapping...")
-semua_node = pd.concat([df_graph['src_node'], df_graph['dst_node']]).unique()
+print("4. Normalisasi Timestamp...")
+t_min = df_graph['time'].min()
+t_max = df_graph['time'].max()
+t_range = t_max - t_min
+
+df_graph['time_delta'] = (df_graph['time'] - t_min).astype(float)
+df_graph['time_norm']  = df_graph['time_delta'] / t_range  # [0, 1]
+ 
+print(f"   Rentang waktu dataset : {t_min} s → {t_max} s")
+print(f"   Durasi total          : {t_range:,} detik ({t_range/86400:.1f} hari)")
+print(f"   time_delta range      : 0.0 → {df_graph['time_delta'].max():.0f}")
+print(f"   time_norm range       : 0.0 → {df_graph['time_norm'].max():.4f}")
+
+print("5. Membuat Node Mapping...")
+semua_node = sorted(
+    pd.concat([df_graph['src_node'], df_graph['dst_node']]).dropna().unique()
+)
 node_map = {node_name: i for i, node_name in enumerate(semua_node)}
-
+ 
 with open(OUT_NODEMAP, 'w') as f:
     json.dump(node_map, f)
+print(f"   Total node unik: {len(node_map):,}")
 
-print("5. Menerapkan Node Mapping ke Graf...")
+print("6. Menerapkan Node Mapping ke Graf...")
 df_graph['src_id'] = df_graph['src_node'].map(node_map)
 df_graph['dst_id'] = df_graph['dst_node'].map(node_map)
 df_graph = df_graph.drop(columns=['src_node', 'dst_node'])
+ 
+# Susun kolom final — urutan sesuai standar input TGN:
+# [timestamp, src, dst, edge_features..., label]
+df_graph = df_graph[[
+    'time', 'time_delta', 'time_norm',   # Tahap 2: raw + normalized timestamp
+    'src_id', 'dst_id',                   # Tahap 1: node identifiers
+    'edge_type', 'auth_type',             # Tahap 1: edge type + FIX auth_type
+    'is_success', 'is_machine',           # Tahap 1: edge features
+    'logon_type',                         # Tahap 1: edge features
+    'label'                               # Ground truth
+]]
 
-# Susun kolom V4
-df_graph = df_graph[['time', 'src_id', 'dst_id', 'edge_type', 'is_success', 'is_machine', 'logon_type', 'label']]
-
-print("6. Menyimpan struktur Graf Akhir...")
+print("7. Menyimpan struktur Graf Akhir...")
 df_graph.to_parquet(OUT_EDGES, index=False)
+ 
+print("\n=== RINGKASAN GRAPH ===")
+print(f"Total edge           : {len(df_graph):,}")
+print(f"Total node unik      : {len(node_map):,}")
+print(f"Edge auth (type=0)   : {(df_graph['edge_type']==0).sum():,}")
+print(f"Edge flow (type=1)   : {(df_graph['edge_type']==1).sum():,}")
+print(f"Edge berlabel attack : {df_graph['label'].sum():,}")
+print(f"\nFile disimpan di: {OUT_EDGES}")
 print("Selesai! Lanjut ke Tahap 3.")
 
 =============================================
@@ -147,9 +232,12 @@ TAHAP 3
 import pandas as pd
 import torch
 import gc
+import os
 
-GRAPH_EDGES_FILE = 'graph_edges.parquet'
-OUTPUT_PYTORCH_FILE = 'tgn_dataset.pt'
+GRAPH_EDGES_FILE = '../../graphs/graph_edges.parquet'
+OUTPUT_PYTORCH_FILE = '../../datasets/tgn_dataset.pt'
+
+os.makedirs(os.path.dirname(OUTPUT_PYTORCH_FILE), exist_ok=True)
 
 print("1. Membaca Graf dari Parquet...")
 df = pd.read_parquet(GRAPH_EDGES_FILE)
@@ -157,12 +245,15 @@ df = pd.read_parquet(GRAPH_EDGES_FILE)
 print("2. Mengubah Data Menjadi PyTorch Tensors...")
 src = torch.tensor(df['src_id'].values, dtype=torch.long)
 dst = torch.tensor(df['dst_id'].values, dtype=torch.long)
-t = torch.tensor(df['time'].values, dtype=torch.long)
+t = torch.tensor(df['time_norm'].values, dtype=torch.float)
 y = torch.tensor(df['label'].values, dtype=torch.float)
 
 print("3. Membuat Edge Features (V4.1 - One-Hot Encoding)...")
 edge_types = df['edge_type'].values
 logon_types = df['logon_type'].values
+
+auth_type_map = {'NTLM': 0, 'Kerberos': 1, 'N/A': 2}
+auth_types = df['auth_type'].map(auth_type_map).fillna(3).values.astype(int)
 
 # Tensor kita berevolusi jadi 8 Kolom!
 msg = torch.zeros((len(df), 8), dtype=torch.float)
@@ -174,11 +265,15 @@ msg[:, 2] = torch.tensor(df['is_success'].values, dtype=torch.float) # Kolom 2: 
 msg[:, 3] = torch.tensor(df['is_machine'].values, dtype=torch.float) # Kolom 3: is_machine
 
 # Fitur One-Hot Encoding untuk Logon Type (Penyembuh Dosa ML)
-msg[logon_types == 2.0, 4] = 1.0   # Kolom 4: Is Logon Type 2 (Interactive)
-msg[logon_types == 3.0, 5] = 1.0   # Kolom 5: Is Logon Type 3 (Network)
-msg[logon_types == 10.0, 6] = 1.0  # Kolom 6: Is Logon Type 10 (Remote)
+msg[logon_types == 2, 4] = 1.0   # Kolom 4: Is Logon Type 2 (Interactive)
+msg[logon_types == 3, 5] = 1.0   # Kolom 5: Is Logon Type 3 (Network)
+msg[logon_types == 10, 6] = 1.0  # Kolom 6: Is Logon Type 10 (Remote)
 # Logon type lainnya atau flow (-1) biarkan masuk ke Kolom 7 (Other)
-msg[(logon_types != 2.0) & (logon_types != 3.0) & (logon_types != 10.0), 7] = 1.0 
+msg[(logon_types != 2) & (logon_types != 3) & (logon_types != 10), 7] = 1.0 
+
+msg[auth_types == 0, 8] = 1.0   # Kolom 8: Is NTLM
+msg[auth_types == 1, 9] = 1.0   # Kolom 9: Is Kerberos
+msg[auth_types >= 2, 10] = 1.0  # Kolom 10: Is Other/N/A
 
 del df, edge_types, logon_types
 gc.collect()
