@@ -3,8 +3,8 @@ import torch
 import gc
 import os
 
-GRAPH_EDGES_FILE = '../../graphs/graph_edges.parquet'
-OUTPUT_PYTORCH_FILE = '../../datasets/tgn_dataset.pt'
+GRAPH_EDGES_FILE = './graphs/graph_edges.parquet'
+OUTPUT_PYTORCH_FILE = './datasets/tgn_dataset.pt'
 
 os.makedirs(os.path.dirname(OUTPUT_PYTORCH_FILE), exist_ok=True)
 

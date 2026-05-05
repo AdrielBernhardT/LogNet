@@ -6,11 +6,11 @@ import os
 # ==========================================
 # KONFIGURASI FILE
 # ==========================================
-AUTH_PARQUET = '../../parsed/auth_sampled_balanced.parquet' 
-FLOWS_FILE   = '../../Dataset RM/pick/flows.txt.gz'
-REDTEAM_FILE = '../../Dataset RM/pick/redteam.txt.gz'
-OUT_EDGES    = '../../graphs/graph_edges.parquet'
-OUT_NODEMAP  = '../../graphs/node_map.json'
+AUTH_PARQUET = './parsed/auth_sampled_balanced.parquet' 
+FLOWS_FILE   = '../../../Dataset RM/Pick/flows.txt.gz'
+REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
+OUT_EDGES    = './graphs/graph_edges.parquet'
+OUT_NODEMAP  = './graphs/node_map.json'
 
 os.makedirs(os.path.dirname(OUT_EDGES), exist_ok=True)
 

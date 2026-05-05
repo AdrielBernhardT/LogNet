@@ -7,7 +7,7 @@ import os
 # ==========================================
 AUTH_FILE    = '../../../Dataset RM/Pick/auth.txt.gz'
 REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
-OUTPUT_FILE  = '../../../parsed/auth_sampled_balanced.parquet'
+OUTPUT_FILE  = './parsed/auth_sampled_balanced.parquet'
 CHUNK_SIZE   = 2_000_000
 
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)

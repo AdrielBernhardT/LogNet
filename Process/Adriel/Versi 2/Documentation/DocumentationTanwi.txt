@@ -8,9 +8,9 @@ import os
 # ==========================================
 # KONFIGURASI FILE
 # ==========================================
-AUTH_FILE    = '../../Dataset RM/pick/auth.txt.gz'
-REDTEAM_FILE = '../../Dataset RM/pick/redteam.txt.gz'
-OUTPUT_FILE  = '../../parsed/auth_sampled_balanced.parquet'
+AUTH_FILE    = '../../../Dataset RM/Pick/auth.txt.gz'
+REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
+OUTPUT_FILE  = './parsed/auth_sampled_balanced.parquet'
 CHUNK_SIZE   = 2_000_000
 
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
@@ -111,7 +111,6 @@ else:
  
     final_df.to_parquet(OUTPUT_FILE, index=False)
     print(f"\nFile berhasil disimpan di: {OUTPUT_FILE}")
-
 =============================================
 TAHAP 2
 =============================================
@@ -123,11 +122,11 @@ import os
 # ==========================================
 # KONFIGURASI FILE
 # ==========================================
-AUTH_PARQUET = '../../parsed/auth_sampled_balanced.parquet' 
-FLOWS_FILE   = '../../Dataset RM/pick/flows.txt.gz'
-REDTEAM_FILE = '../../Dataset RM/pick/redteam.txt.gz'
-OUT_EDGES    = '../../graphs/graph_edges.parquet'
-OUT_NODEMAP  = '../../graphs/node_map.json'
+AUTH_PARQUET = './parsed/auth_sampled_balanced.parquet' 
+FLOWS_FILE   = '../../../Dataset RM/Pick/flows.txt.gz'
+REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
+OUT_EDGES    = './graphs/graph_edges.parquet'
+OUT_NODEMAP  = './graphs/node_map.json'
 
 os.makedirs(os.path.dirname(OUT_EDGES), exist_ok=True)
 
@@ -138,8 +137,8 @@ df_auth_graph = pd.DataFrame({
     'time'       : df_auth['time'],
     'src_node'   : df_auth['src_user'],
     'dst_node'   : df_auth['dst_comp'],
-    'edge_type'  : 0,
-    'auth_type'  : df_auth['auth_type'],      
+    'edge_type'  : 0,                        # 0 = auth event (penanda tipe edge)
+    'auth_type'  : df_auth['auth_type'],      # FIX: nilai asli auth_type (NTLM, Kerberos, dll.)
     'is_success' : df_auth['is_success'],
     'is_machine' : df_auth['is_machine'],
     'logon_type' : df_auth['logon_type'],
@@ -234,8 +233,8 @@ import torch
 import gc
 import os
 
-GRAPH_EDGES_FILE = '../../graphs/graph_edges.parquet'
-OUTPUT_PYTORCH_FILE = '../../datasets/tgn_dataset.pt'
+GRAPH_EDGES_FILE = './graphs/graph_edges.parquet'
+OUTPUT_PYTORCH_FILE = './datasets/tgn_dataset.pt'
 
 os.makedirs(os.path.dirname(OUTPUT_PYTORCH_FILE), exist_ok=True)
 
