@@ -1,0 +1,4 @@
+{
+    "python.defaultInterpreterPath": "path/ke/environment/conda/lognet/python.exe",
+    "python.terminal.activateEnvironment": true
+}
