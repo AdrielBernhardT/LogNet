@@ -33,7 +33,7 @@ auth_cols = [
 ]
  
 chunks_processed    = 0
-total_rows_read     = 0  # FIX 6: tracking baris aktual, bukan estimasi
+total_rows_read     = 0 
 all_sampled_chunks  = []
 
 for chunk in pd.read_csv(AUTH_FILE, header=None, names=auth_cols, chunksize=CHUNK_SIZE):
@@ -45,7 +45,7 @@ for chunk in pd.read_csv(AUTH_FILE, header=None, names=auth_cols, chunksize=CHUN
 
     chunk['is_success'] = (chunk['success'] == 'Success').astype(int)
 
-    chunk['is_machine'] = chunk['src_user'].astype(str).str.endswith('$').astype(int)
+    chunk['is_machine'] = chunk['src_user'].astype(str).str.startswith('C').astype(int)
 
     chunk['logon_type'] = (
         pd.to_numeric(chunk['logon_type'], errors='coerce')
@@ -97,7 +97,7 @@ else:
     total_machine = (final_df['is_machine'] == 1).sum()
     total_human   = (final_df['is_machine'] == 0).sum()
  
-    print("\n=== RINGKASAN DATASET BARU (V4) ===")
+    print("\n=== RINGKASAN DATASET BARU ===")
     print(f"Total baris              : {total:>12,}")
     print(f"--- Label ---")
     print(f"  Serangan  (label=1)    : {total_attack:>12,}  ({total_attack/total*100:.2f}%)")

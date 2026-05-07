@@ -1,0 +1,902 @@
+=============================================
+TAHAP 1
+=============================================
+import pandas as pd
+import gc
+import os
+
+# ==========================================
+# KONFIGURASI FILE
+# ==========================================
+AUTH_FILE    = '../../../Dataset RM/Pick/auth.txt.gz'
+REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
+OUTPUT_FILE  = './parsed/auth_sampled_balanced.parquet'
+CHUNK_SIZE   = 2_000_000
+
+os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+
+print("1. Membaca data Redteam (Kunci Jawaban)...")
+ 
+redteam_cols = ['time', 'user_domain', 'src_comp', 'dst_comp']
+df_redteam = pd.read_csv(REDTEAM_FILE, header=None, names=redteam_cols)
+ 
+redteam_signatures = set(
+    zip(df_redteam['time'], df_redteam['user_domain'], df_redteam['src_comp'], df_redteam['dst_comp'])
+)
+del df_redteam
+gc.collect()
+ 
+print(f"   Total signature serangan unik: {len(redteam_signatures):,}")
+
+print("\n2. Memproses Log Auth...")
+ 
+auth_cols = [
+    'time', 'src_user', 'dst_user', 'src_comp', 'dst_comp',
+    'auth_type', 'logon_type', 'orientation', 'success'
+]
+ 
+chunks_processed    = 0
+total_rows_read     = 0 
+all_sampled_chunks  = []
+
+for chunk in pd.read_csv(AUTH_FILE, header=None, names=auth_cols, chunksize=CHUNK_SIZE):
+    chunk_signatures = list(
+        zip(chunk['time'], chunk['src_user'], chunk['src_comp'], chunk['dst_comp'])
+    )
+    
+    chunk['label'] = [1 if sig in redteam_signatures else 0 for sig in chunk_signatures]
+
+    chunk['is_success'] = (chunk['success'] == 'Success').astype(int)
+
+    chunk['is_machine'] = chunk['src_user'].astype(str).str.startswith('C').astype(int)
+
+    chunk['logon_type'] = (
+        pd.to_numeric(chunk['logon_type'], errors='coerce')
+        .fillna(-1)
+        .astype(int)
+    )
+
+    attack_data = chunk[chunk['label'] == 1].copy()
+    normal_data = chunk[chunk['label'] == 0].copy()
+
+    if len(normal_data) > 0:
+        sampled_normal = normal_data.sample(frac=0.01, random_state=42)
+    else:
+        sampled_normal = normal_data.copy()
+ 
+    combined_chunk = pd.concat([attack_data, sampled_normal], ignore_index=True)
+
+    combined_chunk = combined_chunk[[
+        'time', 'src_user', 'src_comp', 'dst_comp',
+        'is_success', 'is_machine', 'logon_type', 'label'
+    ]]
+
+    all_sampled_chunks.append(combined_chunk)
+
+    total_rows_read += len(chunk)
+    chunks_processed += 1
+    print(
+        f"   Chunk {chunks_processed:>3} selesai | "
+        f"Dibaca: {total_rows_read:>12,} baris | "
+        f"Attack: {len(attack_data):>5,} | "
+        f"Normal sampled: {len(sampled_normal):>7,}"
+    )
+ 
+    del chunk, attack_data, normal_data, sampled_normal, combined_chunk
+    gc.collect()
+
+print("\n3. Menyimpan hasil akhir...")
+if not all_sampled_chunks:
+    print("ERROR: Tidak ada data yang berhasil diproses.")
+    print("       Periksa path file:")
+    print(f"       AUTH_FILE    = {AUTH_FILE}")
+    print(f"       REDTEAM_FILE = {REDTEAM_FILE}")
+else:
+    final_df = pd.concat(all_sampled_chunks, ignore_index=True)
+
+    total         = len(final_df)
+    total_attack  = (final_df['label'] == 1).sum()
+    total_normal  = (final_df['label'] == 0).sum()
+    total_machine = (final_df['is_machine'] == 1).sum()
+    total_human   = (final_df['is_machine'] == 0).sum()
+ 
+    print("\n=== RINGKASAN DATASET BARU ===")
+    print(f"Total baris              : {total:>12,}")
+    print(f"--- Label ---")
+    print(f"  Serangan  (label=1)    : {total_attack:>12,}  ({total_attack/total*100:.2f}%)")
+    print(f"  Normal    (label=0)    : {total_normal:>12,}  ({total_normal/total*100:.2f}%)")
+    print(f"--- Tipe Akun ---")
+    print(f"  Mesin     (is_machine=1): {total_machine:>11,}  ({total_machine/total*100:.2f}%)")
+    print(f"  Manusia   (is_machine=0): {total_human:>11,}  ({total_human/total*100:.2f}%)")
+ 
+    final_df.to_parquet(OUTPUT_FILE, index=False)
+    print(f"\nFile berhasil disimpan di: {OUTPUT_FILE}")
+    
+=============================================
+TAHAP 2
+=============================================
+import pandas as pd
+import gc
+import json
+import os
+
+# ==========================================
+# KONFIGURASI FILE
+# ==========================================
+AUTH_PARQUET = './parsed/auth_sampled_balanced.parquet' 
+FLOWS_FILE   = '../../../Dataset RM/Pick/flows.txt.gz'
+REDTEAM_FILE = '../../../Dataset RM/Pick/redteam.txt.gz'
+OUT_EDGES    = './graphs/graph_edges.parquet'
+OUT_NODEMAP  = './graphs/node_map.json'
+
+os.makedirs(os.path.dirname(OUT_EDGES), exist_ok=True)
+
+print("1. Memuat data Auth...")
+df_auth = pd.read_parquet(AUTH_PARQUET)
+
+df_auth_graph = pd.DataFrame({
+    'time'       : df_auth['time'],
+    'src_node'   : df_auth['src_user'],
+    'dst_node'   : df_auth['dst_comp'],
+    'edge_type'  : 0,                 
+    'auth_type'  : 'Unknown',      
+    'is_success' : df_auth['is_success'],
+    'is_machine' : df_auth['is_machine'],
+    'logon_type' : df_auth['logon_type'],
+    'label'      : df_auth['label']
+})
+del df_auth
+gc.collect()
+
+print("2. Memuat sampel data Flows...")
+flow_cols = [
+    'time', 'duration', 'src_comp', 'src_port',
+    'dst_comp', 'dst_port', 'protocol', 'packet_count', 'byte_count'
+]
+df_flow_raw = pd.read_csv(
+    FLOWS_FILE, header=None, names=flow_cols, nrows=500_000
+)
+ 
+df_flow_graph = pd.DataFrame({
+    'time'       : df_flow_raw['time'],
+    'src_node'   : df_flow_raw['src_comp'],
+    'dst_node'   : df_flow_raw['dst_comp'],
+    'edge_type'  : 1,          # 1 = flow event
+    'auth_type'  : 'N/A',      # Flow tidak memiliki auth_type
+    'is_success' : 1,
+    'is_machine' : 1,          # Flow = komunikasi mesin ke mesin
+    'logon_type' : -1,         # Flow tidak memiliki logon type
+    'label'      : 0
+})
+del df_flow_raw
+gc.collect()
+
+print("3. Menggabungkan Auth dan Flows...")
+df_graph = pd.concat([df_auth_graph, df_flow_graph], ignore_index=True)
+del df_auth_graph, df_flow_graph   # tambahkan ini
+gc.collect()
+
+df_graph = df_graph.sort_values('time').reset_index(drop=True)
+
+print("4. Normalisasi Timestamp...")
+t_min = df_graph['time'].min()
+t_max = df_graph['time'].max()
+t_range = t_max - t_min
+
+df_graph['time_delta'] = (df_graph['time'] - t_min).astype(float)
+df_graph['time_norm']  = df_graph['time_delta'] / t_range  # [0, 1]
+ 
+print(f"   Rentang waktu dataset : {t_min} s → {t_max} s")
+print(f"   Durasi total          : {t_range:,} detik ({t_range/86400:.1f} hari)")
+print(f"   time_delta range      : 0.0 → {df_graph['time_delta'].max():.0f}")
+print(f"   time_norm range       : 0.0 → {df_graph['time_norm'].max():.4f}")
+
+print("5. Membuat Node Mapping...")
+semua_node = sorted(
+    pd.concat([df_graph['src_node'], df_graph['dst_node']]).dropna().unique()
+)
+node_map = {node_name: i for i, node_name in enumerate(semua_node)}
+ 
+with open(OUT_NODEMAP, 'w') as f:
+    json.dump(node_map, f)
+print(f"   Total node unik: {len(node_map):,}")
+
+print("6. Menerapkan Node Mapping ke Graf...")
+df_graph['src_id'] = df_graph['src_node'].map(node_map)
+df_graph['dst_id'] = df_graph['dst_node'].map(node_map)
+df_graph = df_graph.drop(columns=['src_node', 'dst_node'])
+gc.collect() 
+
+df_graph = df_graph[[
+    'time', 'time_delta', 'time_norm',  
+    'src_id', 'dst_id',                   
+    'edge_type',           
+    'is_success', 'is_machine',         
+    'logon_type',                         
+    'label'                              
+]]
+
+print("7. Menyimpan struktur Graf Akhir...")
+df_graph.to_parquet(OUT_EDGES, index=False)
+ 
+print("\n=== RINGKASAN GRAPH ===")
+print(f"Total edge           : {len(df_graph):,}")
+print(f"Total node unik      : {len(node_map):,}")
+print(f"Edge auth (type=0)   : {(df_graph['edge_type']==0).sum():,}")
+print(f"Edge flow (type=1)   : {(df_graph['edge_type']==1).sum():,}")
+print(f"Edge berlabel attack : {df_graph['label'].sum():,}")
+print(f"\nFile disimpan di: {OUT_EDGES}")
+print("Selesai! Lanjut ke Tahap 3.")
+
+=============================================
+TAHAP 3
+=============================================
+import pandas as pd
+import torch
+import gc
+import os
+
+GRAPH_EDGES_FILE = './graphs/graph_edges.parquet'
+OUTPUT_PYTORCH_FILE = './datasets/tgn_dataset.pt'
+
+os.makedirs(os.path.dirname(OUTPUT_PYTORCH_FILE), exist_ok=True)
+
+# 1. BACA DATA
+print("1. Membaca Graf dari Parquet...")
+df = pd.read_parquet(GRAPH_EDGES_FILE)
+
+print(f"\n   Kolom tersedia: {df.columns.tolist()}")
+print(f"   Sample 5 baris:")
+print(df.head())
+
+
+# 2. TENTUKAN KOLOM TIMESTAMP ASLI
+# FIX: 't' harus berisi timestamp ASLI, bukan
+# time_norm. TGN menggunakan 't' untuk menghitung
+# delta waktu antar event (rel_t). Jika semua
+# nilai t = 0 atau 1, semua event dianggap
+# terjadi "bersamaan" — memory module tidak bisa
+# belajar pola temporal apapun.
+#
+# Prioritas pencarian kolom timestamp asli:
+#   1. 'time'       — detik sejak epoch (LANL)
+#   2. 'timestamp'  — nama umum lainnya
+#   3. 'time_unix'  — kadang dipakai di preprocessing
+#   4. 'second'     — format LANL asli
+#
+# time_norm TETAP disimpan sebagai fitur di msg
+# (kolom ke-8) agar informasi posisi relatif
+# dalam dataset bisa dimanfaatkan model.
+
+TIMESTAMP_CANDIDATES = ['time', 'timestamp', 'time_unix', 'second', 'ts']
+time_col = None
+for col in TIMESTAMP_CANDIDATES:
+    if col in df.columns:
+        time_col = col
+        break
+
+if time_col is None:
+    num_cols = df.select_dtypes(include='number').columns.tolist()
+    raise ValueError(
+        f"Tidak ditemukan kolom timestamp asli.\n"
+        f"Kolom numerik yang tersedia: {num_cols}\n"
+        f"Ganti TIMESTAMP_CANDIDATES di atas dengan nama kolom yang benar."
+    )
+
+print(f"\n   Menggunakan kolom timestamp: '{time_col}'")
+print(f"   Range nilai: {df[time_col].min()} – {df[time_col].max()}")
+print(f"   Unique values: {df[time_col].nunique():,}")
+
+t_raw = df[time_col].values
+if pd.api.types.is_float_dtype(t_raw):
+    import numpy as np
+    t_raw = np.floor(t_raw).astype('int64')
+
+# 3. BUAT TENSOR
+print("\n2. Mengubah Data Menjadi PyTorch Tensors...")
+src = torch.tensor(df['src_id'].values,  dtype=torch.long)
+dst = torch.tensor(df['dst_id'].values,  dtype=torch.long)
+t   = torch.tensor(t_raw,                dtype=torch.long)
+y   = torch.tensor(df['label'].values,   dtype=torch.float)
+
+print(f"   t — min: {t.min().item()}, max: {t.max().item()}, "
+      f"unique: {t.unique().numel():,} dari {t.numel():,} events")
+
+# 4. BUAT EDGE FEATURES (9 KOLOM)
+#
+# Kolom 0–7: sama seperti sebelumnya
+# Kolom 8  : time_norm (posisi relatif dalam dataset)
+#            Berguna sebagai fitur kontekstual di msg,
+#            tapi TIDAK digunakan sebagai 't'.
+
+print("\n3. Membuat Edge Features (V4.2 - 9 kolom)...")
+msg = torch.zeros((len(df), 9), dtype=torch.float)
+
+# Kolom 0-1: edge type
+msg[:, 0] = torch.tensor((df['edge_type'] == 0).values, dtype=torch.float)
+msg[:, 1] = torch.tensor((df['edge_type'] == 1).values, dtype=torch.float)
+
+# Kolom 2-3: fitur dasar
+msg[:, 2] = torch.tensor(df['is_success'].values, dtype=torch.float)
+msg[:, 3] = torch.tensor(df['is_machine'].values, dtype=torch.float)
+
+# Kolom 4-7: logon type one-hot (Sesuaikan angka dengan dataset aslimu jika beda)
+msg[:, 4] = torch.tensor((df['logon_type'] == 2).values, dtype=torch.float)
+msg[:, 5] = torch.tensor((df['logon_type'] == 3).values, dtype=torch.float)
+msg[:, 6] = torch.tensor((df['logon_type'] == 7).values, dtype=torch.float)
+msg[:, 7] = torch.tensor((df['logon_type'] == 10).values, dtype=torch.float)
+
+# Kolom 8: time_norm sebagai fitur
+if 'time_norm' in df.columns:
+    msg[:, 8] = torch.tensor(df['time_norm'].values, dtype=torch.float)
+
+del df
+gc.collect()
+
+# 5. SIMPAN
+print("\n4. Menyimpan PyTorch Dataset...")
+torch.save({'src': src, 'dst': dst, 't': t, 'msg': msg, 'y': y},
+           OUTPUT_PYTORCH_FILE)
+
+print("\n=== RINGKASAN TENSOR ===")
+print(f"src shape  : {src.shape}")
+print(f"dst shape  : {dst.shape}")
+print(f"t shape    : {t.shape}  (timestamp ASLI, bukan time_norm)")
+print(f"msg shape  : {msg.shape}  (9 kolom: 2 edge_type + 2 dasar + 4 logon + 1 time_norm)")
+print(f"y shape    : {y.shape}")
+label_counts = y.unique(return_counts=True)
+print(f"y distribusi: {dict(zip(label_counts[0].tolist(), label_counts[1].tolist()))}")
+print(f"\nFile disimpan di: {OUTPUT_PYTORCH_FILE}")
+
+=============================================
+TAHAP 4
+=============================================
+import torch
+import os
+from torch_geometric.data import TemporalData
+from torch_geometric.loader import TemporalDataLoader
+from torch_geometric.nn import TGNMemory, TransformerConv
+from torch.nn import Linear, ReLU
+from torch_geometric.nn.models.tgn import LastAggregator, LastNeighborLoader
+from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
+
+os.makedirs('./models', exist_ok=True)
+
+# 1. PERSIAPAN PERANGKAT & DATA
+print("1. Menyiapkan Perangkat dan Data...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Menggunakan Device: {device}")
+
+data_dict = torch.load('./datasets/tgn_dataset.pt')
+data = TemporalData(
+    src=data_dict['src'],
+    dst=data_dict['dst'],
+    t=data_dict['t'].long(),
+    msg=data_dict['msg'],
+    y=data_dict['y']
+)
+
+# 2. TEMPORAL SPLIT (INDEX-BASED)
+print("\n2. Membuat Temporal Train/Val/Test Split (index-based)...")
+
+t_vals = data.t
+print(f"   Timestamp — min: {t_vals.min().item()}, "
+      f"max: {t_vals.max().item()}, "
+      f"unique: {t_vals.unique().numel():,} dari {t_vals.numel():,} events")
+
+perm = data.t.argsort(stable=True)
+data.src = data.src[perm]
+data.dst = data.dst[perm]
+data.t   = data.t[perm]
+data.msg = data.msg[perm]
+data.y   = data.y[perm]
+
+n_total = data.t.size(0)
+n_train = int(n_total * 0.35)
+n_val   = int(n_total * 0.20)
+
+idx_train_end = n_train
+idx_val_end   = n_train + n_val
+
+def slice_temporal(data, start, end):
+    return TemporalData(
+        src=data.src[start:end], dst=data.dst[start:end],
+        t=data.t[start:end], msg=data.msg[start:end], y=data.y[start:end],
+    )
+
+train_data = slice_temporal(data, 0, idx_train_end)
+val_data   = slice_temporal(data, idx_train_end, idx_val_end)
+test_data  = slice_temporal(data, idx_val_end,   n_total)
+
+print(f"-> Train : {train_data.num_events:,} events")
+print(f"-> Val   : {val_data.num_events:,} events")
+print(f"-> Test  : {test_data.num_events:,} events")
+
+train_data = train_data.to(device)
+val_data   = val_data.to(device)
+test_data  = test_data.to(device)
+data       = data.to(device)
+
+train_loader  = TemporalDataLoader(train_data, batch_size=2000)
+val_loader    = TemporalDataLoader(val_data,   batch_size=2000)
+test_loader   = TemporalDataLoader(test_data,  batch_size=2000)
+warmup_loader = TemporalDataLoader(train_data, batch_size=5000)
+
+# 3. WEIGHTED LOSS (Dari TRAIN saja)
+print("\n3. Menghitung Class Weight dari Data Training...")
+jumlah_normal   = (train_data.y == 0).sum().item()
+jumlah_serangan = (train_data.y == 1).sum().item()
+
+if jumlah_serangan == 0:
+    raise ValueError("Tidak ada label serangan (y=1) di training set.")
+
+pos_weight_val = torch.tensor([jumlah_normal / jumlah_serangan], device=device)
+criterion      = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_val)
+print(f"-> Normal / Serangan: {jumlah_normal:,} / {jumlah_serangan:,}")
+print(f"-> Bobot serangan   : {pos_weight_val.item():.2f}x")
+
+# 4. DEFINISI MODEL
+print("\n4. Merakit Model TGN...")
+memory_dim = 100
+time_dim   = 100
+num_nodes = max(data.src.max(), data.dst.max()).item() + 1
+# SUDAH BENAR: Menyiapkan ruang kosong (buffer) untuk node masa depan
+num_nodes_buffer = num_nodes + 100000
+msg_dim    = data.msg.size(1)
+
+class LearnedMessageModule(torch.nn.Module):
+    def __init__(self, msg_dim, memory_dim, time_dim):
+        super().__init__()
+        in_dim = memory_dim + memory_dim + msg_dim + time_dim
+        self.lin1 = Linear(in_dim, memory_dim)
+        self.lin2 = Linear(memory_dim, memory_dim)
+        self.act  = ReLU()
+        self.out_channels = memory_dim
+
+    def forward(self, z_src, z_dst, raw_msg, t_enc):
+        x = torch.cat([z_src, z_dst, raw_msg, t_enc], dim=-1)
+        return self.lin2(self.act(self.lin1(x)))
+
+msg_module = LearnedMessageModule(msg_dim, memory_dim, time_dim)
+
+memory = TGNMemory(
+    num_nodes=num_nodes_buffer,
+    raw_msg_dim=msg_dim,
+    memory_dim=memory_dim,
+    time_dim=time_dim,
+    message_module=msg_module,
+    aggregator_module=LastAggregator(),
+).to(device)
+
+class TimeEncoder(torch.nn.Module):
+    def __init__(self, out_channels):
+        super().__init__()
+        self.lin = Linear(1, out_channels)
+    def forward(self, t):
+        return self.lin(t.float().unsqueeze(-1)).cos()
+
+time_encoder = TimeEncoder(out_channels=time_dim).to(device)
+
+class GraphAttentionEmbedding(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, msg_dim, time_dim):
+        super().__init__()
+        edge_dim = msg_dim + time_dim
+        self.conv = TransformerConv(
+            in_channels, out_channels // 2, heads=2, dropout=0.1, edge_dim=edge_dim
+        )
+    def forward(self, x, last_update, edge_index, t, msg):
+        rel_t     = (last_update[edge_index[0]] - t.float())
+        rel_t_enc = time_encoder(rel_t)
+        edge_attr = torch.cat([rel_t_enc, msg], dim=-1)
+        return self.conv(x, edge_index, edge_attr)
+
+gnn = GraphAttentionEmbedding(
+    in_channels=memory_dim, out_channels=memory_dim, msg_dim=msg_dim, time_dim=time_dim,
+).to(device)
+
+neighbor_loader = LastNeighborLoader(num_nodes_buffer, size=15, device=device)
+
+class LinkPredictor(torch.nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.lin_src   = Linear(in_channels, in_channels)
+        self.lin_dst   = Linear(in_channels, in_channels)
+        self.lin_final = Linear(in_channels, 1)
+
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
+        h = h.relu()
+        return self.lin_final(h)
+
+link_pred = LinkPredictor(in_channels=memory_dim).to(device)
+assoc = torch.empty(num_nodes_buffer, dtype=torch.long, device=device)
+
+all_params = (
+    set(memory.parameters())       |
+    set(gnn.parameters())          |
+    set(time_encoder.parameters()) |
+    set(link_pred.parameters())
+)
+optimizer = torch.optim.Adam(all_params, lr=0.0001)
+
+# 5. FUNGSI: AMBIL EMBEDDING
+def get_node_embeddings(src, dst):
+    all_nodes              = torch.cat([src, dst]).unique()
+    n_id, edge_index, e_id = neighbor_loader(all_nodes)
+    z, last_update         = memory(n_id)
+
+    if edge_index.numel() > 0:
+        z = gnn(z, last_update, edge_index,
+                data.t[e_id].float(),
+                data.msg[e_id])
+
+    assoc[n_id] = torch.arange(n_id.size(0), device=device)
+    return z[assoc[src]], z[assoc[dst]]
+
+# 6. WARM-UP STATE DARI TRAIN DATA
+@torch.no_grad()
+def warmup_state_from_train():
+    memory.eval()
+    gnn.eval()
+    link_pred.eval()
+    memory.reset_state()
+    neighbor_loader.reset_state()
+
+    for batch in warmup_loader:
+        _ = get_node_embeddings(batch.src, batch.dst)
+        neighbor_loader.insert(batch.src, batch.dst)
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+
+# 7. FUNGSI: EVALUASI
+@torch.no_grad()
+def evaluate(loader, loader_name=""):
+    memory.eval()
+    gnn.eval()
+    link_pred.eval()
+
+    all_probs, all_labels = [], []
+
+    for batch in loader:
+        z_src, z_dst = get_node_embeddings(batch.src, batch.dst)
+        prob = torch.sigmoid(link_pred(z_src, z_dst).squeeze())
+
+        all_probs.append(prob.cpu())
+        all_labels.append(batch.y.cpu())
+
+        neighbor_loader.insert(batch.src, batch.dst)
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+
+    all_probs  = torch.cat(all_probs).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+
+    if all_labels.sum() == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.5
+
+    prec_arr, rec_arr, thresholds = precision_recall_curve(all_labels, all_probs)
+    f1_arr      = 2 * prec_arr * rec_arr / (prec_arr + rec_arr + 1e-8)
+    best_idx    = f1_arr[:-1].argmax()
+    best_thresh = float(thresholds[best_idx])
+
+    preds = (all_probs >= best_thresh).astype(float)
+    tp = ((preds == 1) & (all_labels == 1)).sum()
+    fp = ((preds == 1) & (all_labels == 0)).sum()
+    fn = ((preds == 0) & (all_labels == 1)).sum()
+
+    prec   = tp / (tp + fp + 1e-8)
+    rec    = tp / (tp + fn + 1e-8)
+    f1     = 2 * prec * rec / (prec + rec + 1e-8)
+    auc    = roc_auc_score(all_labels, all_probs)
+    pr_auc = average_precision_score(all_labels, all_probs)
+
+    return prec, rec, f1, auc, pr_auc, best_thresh
+
+# ==========================================
+# 8. TRAINING LOOP (Diperbaiki: Tanpa Negative Sampling)
+# ==========================================
+print("\n8. Memulai Training (5 Epoch)...")
+best_val_f1 = 0.0
+
+for epoch in range(5):
+    memory.train()
+    gnn.train()
+    link_pred.train()
+    memory.reset_state()
+    neighbor_loader.reset_state()
+    total_loss = 0
+
+    for i, batch in enumerate(train_loader):
+        optimizer.zero_grad()
+        memory.detach()
+
+        # ---- AMBIL EMBEDDING & PREDIKSI KONEKSI ASLI ----
+        z_src, z_dst = get_node_embeddings(batch.src, batch.dst)
+        pred = link_pred(z_src, z_dst).squeeze()
+
+        # ---- LOSS KLASIFIKASI (Normal vs Serangan) ----
+        # Hanya menggunakan label asli untuk mendeteksi anomali
+        loss = criterion(pred, batch.y.float())
+
+        loss.backward()
+        optimizer.step()
+
+        # Update state SETELAH backward
+        neighbor_loader.insert(batch.src, batch.dst)
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+        total_loss += loss.item()
+
+        if (i + 1) % 500 == 0:
+            print(f"  Epoch {epoch+1} | Batch {i+1}/{len(train_loader)} "
+                  f"| Loss: {loss.item():.4f}")
+
+    avg_loss = total_loss / len(train_loader)
+    print(f"\n=== Epoch {epoch+1} Selesai | Avg Loss: {avg_loss:.4f} ===")
+
+    print("   [WARMUP] Mengisi state dari train data...")
+    warmup_state_from_train()
+    prec, rec, f1, auc, pr_auc, thresh = evaluate(val_loader, "VAL")
+    print(f"   [VAL] Precision: {prec:.4f} | Recall: {rec:.4f} | "
+          f"F1: {f1:.4f} | AUC-ROC: {auc:.4f} | "
+          f"PR-AUC: {pr_auc:.4f} | Threshold: {thresh:.3f}")
+
+    if f1 > best_val_f1:
+        best_val_f1 = f1
+        torch.save(memory.state_dict(),       './models/tgn_memory_best.pth')
+        torch.save(gnn.state_dict(),          './models/tgn_gnn_best.pth')
+        torch.save(time_encoder.state_dict(), './models/tgn_timeenc_best.pth')
+        torch.save(link_pred.state_dict(),    './models/tgn_predictor_best.pth')
+        # FIX: Simpan state optimizer untuk Continuous Training!
+        torch.save(optimizer.state_dict(),    './models/tgn_optimizer_best.pth')
+        print(f"   ✅ Model terbaik disimpan! (Val F1: {best_val_f1:.4f})")
+
+# ==========================================
+# 9. EVALUASI FINAL DI TEST SET
+# ==========================================
+print("\n9. Memuat model terbaik dan evaluasi di Test Set...")
+memory.load_state_dict(torch.load('./models/tgn_memory_best.pth'))
+gnn.load_state_dict(torch.load('./models/tgn_gnn_best.pth'))
+time_encoder.load_state_dict(torch.load('./models/tgn_timeenc_best.pth'))
+link_pred.load_state_dict(torch.load('./models/tgn_predictor_best.pth'))
+
+print("   [WARMUP] Mengisi state: train...")
+warmup_state_from_train()
+print("   [WARMUP] Melanjutkan state: val...")
+with torch.no_grad():
+    for batch in val_loader:
+        _ = get_node_embeddings(batch.src, batch.dst)
+        neighbor_loader.insert(batch.src, batch.dst)
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+
+prec, rec, f1, auc, pr_auc, thresh = evaluate(test_loader, "TEST")
+print(f"\n{'='*60}")
+print(f"  [TEST FINAL] Precision : {prec:.4f}")
+print(f"  [TEST FINAL] Recall    : {rec:.4f}")
+print(f"  [TEST FINAL] F1-Score  : {f1:.4f}")
+print(f"  [TEST FINAL] AUC-ROC   : {auc:.4f}")
+print(f"  [TEST FINAL] PR-AUC    : {pr_auc:.4f}  ← metrik utama untuk imbalanced")
+print(f"  [TEST FINAL] Threshold : {thresh:.3f}")
+print(f"{'='*60}")
+print("\nTraining selesai. Semua model tersimpan di ./models/")
+
+=============================================
+TAHAP 5
+=============================================
+import torch
+import os
+from torch.nn import Linear, ReLU
+from torch_geometric.data import TemporalData
+from torch_geometric.loader import TemporalDataLoader
+from torch_geometric.nn import TGNMemory, TransformerConv
+from torch_geometric.nn.models.tgn import LastAggregator, LastNeighborLoader
+from sklearn.metrics import classification_report, confusion_matrix, average_precision_score, roc_auc_score, precision_recall_curve
+import numpy as np
+
+# 1. PERSIAPAN PERANGKAT & DATA
+print("1. Menyiapkan Perangkat dan Data...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# FIX: Sesuaikan path dengan output Tahap 3
+data_dict = torch.load('./datasets/tgn_dataset.pt')
+data = TemporalData(
+    src=data_dict['src'], 
+    dst=data_dict['dst'], 
+    t=data_dict['t'].long(), # FIX: Pastikan format long()
+    msg=data_dict['msg'], 
+    y=data_dict['y']
+).to(device)
+
+test_loader = TemporalDataLoader(data, batch_size=2000)
+
+# 2. MEMBANGUN ULANG KERANGKA (SINKRON DENGAN TAHAP 4)
+print("2. Membangun ulang kerangka TGN...")
+memory_dim = 100
+time_dim   = 100
+msg_dim    = data.msg.size(1)
+
+num_nodes = max(data.src.max(), data.dst.max()).item() + 1
+# FIX: Harus sama persis dengan buffer Tahap 4 agar state_dict cocok
+num_nodes_buffer = num_nodes + 100000 
+
+# --- [A] Custom Message Module ---
+class LearnedMessageModule(torch.nn.Module):
+    def __init__(self, msg_dim, memory_dim, time_dim):
+        super().__init__()
+        in_dim = memory_dim + memory_dim + msg_dim + time_dim
+        self.lin1 = Linear(in_dim, memory_dim)
+        self.lin2 = Linear(memory_dim, memory_dim)
+        self.act  = ReLU()
+        self.out_channels = memory_dim
+
+    def forward(self, z_src, z_dst, raw_msg, t_enc):
+        x = torch.cat([z_src, z_dst, raw_msg, t_enc], dim=-1)
+        return self.lin2(self.act(self.lin1(x)))
+
+# --- [B] TGN Memory ---
+memory = TGNMemory(
+    num_nodes=num_nodes_buffer,
+    raw_msg_dim=msg_dim,
+    memory_dim=memory_dim,
+    time_dim=time_dim,
+    message_module=LearnedMessageModule(msg_dim, memory_dim, time_dim),
+    aggregator_module=LastAggregator()
+).to(device)
+
+# --- [C] Time Encoder ---
+class TimeEncoder(torch.nn.Module):
+    def __init__(self, out_channels):
+        super().__init__()
+        self.lin = Linear(1, out_channels)
+    def forward(self, t):
+        return self.lin(t.float().unsqueeze(-1)).cos()
+
+time_encoder = TimeEncoder(out_channels=time_dim).to(device)
+
+# --- [D] Graph Attention Embedding ---
+class GraphAttentionEmbedding(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, msg_dim, time_dim):
+        super().__init__()
+        edge_dim = msg_dim + time_dim
+        self.conv = TransformerConv(
+            in_channels, out_channels // 2, heads=2, dropout=0.1, edge_dim=edge_dim
+        )
+    def forward(self, x, last_update, edge_index, t, msg):
+        rel_t     = (last_update[edge_index[0]] - t.float())
+        rel_t_enc = time_encoder(rel_t)
+        edge_attr = torch.cat([rel_t_enc, msg], dim=-1)
+        return self.conv(x, edge_index, edge_attr)
+
+gnn = GraphAttentionEmbedding(
+    in_channels=memory_dim, out_channels=memory_dim, msg_dim=msg_dim, time_dim=time_dim,
+).to(device)
+
+# --- [E] Neighbor Loader ---
+neighbor_loader = LastNeighborLoader(num_nodes_buffer, size=15, device=device)
+
+# --- [F] Link Predictor ---
+class LinkPredictor(torch.nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.lin_src   = Linear(in_channels, in_channels)
+        self.lin_dst   = Linear(in_channels, in_channels)
+        self.lin_final = Linear(in_channels, 1)
+
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
+        h = h.relu()
+        return self.lin_final(h)
+
+link_pred = LinkPredictor(in_channels=memory_dim).to(device)
+assoc = torch.empty(num_nodes_buffer, dtype=torch.long, device=device)
+
+# --- FUNGSI AMBIL EMBEDDING (Wajib ada untuk Inference) ---
+def get_node_embeddings(src, dst):
+    all_nodes              = torch.cat([src, dst]).unique()
+    n_id, edge_index, e_id = neighbor_loader(all_nodes)
+    z, last_update         = memory(n_id)
+
+    if edge_index.numel() > 0:
+        z = gnn(z, last_update, edge_index, data.t[e_id].float(), data.msg[e_id])
+
+    assoc[n_id] = torch.arange(n_id.size(0), device=device)
+    return z[assoc[src]], z[assoc[dst]]
+
+# 3. LOAD "OTAK" DETEKTIF FORENSIK
+print("3. Memasukkan memori Detektif Forensik...")
+# FIX: Path disesuaikan dengan output Tahap 4 dan load semua modul
+memory.load_state_dict(torch.load('./models/tgn_memory_best.pth', map_location=device))
+gnn.load_state_dict(torch.load('./models/tgn_gnn_best.pth', map_location=device))
+time_encoder.load_state_dict(torch.load('./models/tgn_timeenc_best.pth', map_location=device))
+link_pred.load_state_dict(torch.load('./models/tgn_predictor_best.pth', map_location=device))
+
+# 4. PROSES EVALUASI (INFERENCE)
+print("\n4. Memulai Proses Evaluasi (Inference)...")
+memory.eval()
+gnn.eval()
+link_pred.eval()
+
+all_preds_prob = []
+all_true_labels = []
+
+memory.reset_state()
+neighbor_loader.reset_state() 
+
+with torch.no_grad(): 
+    for i, batch in enumerate(test_loader):
+        batch = batch.to(device)
+        
+        # FIX: Gunakan get_node_embeddings agar GNN ikut bekerja, bukan langsung memory()
+        z_src, z_dst = get_node_embeddings(batch.src, batch.dst)
+        
+        pred = link_pred(z_src, z_dst).squeeze()
+        prob = torch.sigmoid(pred) 
+        
+        # Tangani kasus di mana prob hanya berisi 1 elemen (skalar)
+        if prob.dim() == 0:
+            prob = prob.unsqueeze(0)
+            
+        all_preds_prob.extend(prob.cpu().tolist())
+        all_true_labels.extend(batch.y.cpu().tolist())
+        
+        # FIX: Jangan lupa insert ke neighbor_loader
+        neighbor_loader.insert(batch.src, batch.dst)
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+        
+        if (i+1) % 1000 == 0:
+            print(f"Selesai menebak {i+1} batch...")
+
+# 5. CETAK RAPOR EVALUASI & DIAGNOSA
+print("\n" + "="*40)
+print("TEST RESULT TGN")
+print("="*40)
+
+all_preds_prob = np.array(all_preds_prob)
+all_true_labels = np.array(all_true_labels)
+
+# --- DIAGNOSA SKOR ATTACK ---
+attack_scores = all_preds_prob[all_true_labels == 1]
+normal_scores = all_preds_prob[all_true_labels == 0]
+
+# Safety check jika evaluasi ini tidak punya sampel attack sama sekali
+if len(attack_scores) > 0:
+    print(f"Skor Attack TERTINGGI  : {np.max(attack_scores):.6f}")
+    print(f"Skor Attack TERENDAH   : {np.min(attack_scores):.6f}")
+    print(f"Rata-rata Skor Attack  : {np.mean(attack_scores):.6f}")
+else:
+    print("WARNING: Tidak ada label serangan (1) pada sampel ini.")
+
+if len(normal_scores) > 0:
+    print(f"Rata-rata Skor Normal  : {np.mean(normal_scores):.6f}")
+
+# --- PENCARIAN THRESHOLD OPTIMAL (SMART F1-MAXIMIZATION) ---
+print("\n[INFO] Menghitung ribuan skenario jaring untuk mencari titik optimal...")
+if len(attack_scores) > 0:
+    precisions, recalls, thresholds = precision_recall_curve(all_true_labels, all_preds_prob)
+
+    # Rumus F1-Score untuk mencari keseimbangan terbaik
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-10)
+    best_idx = np.argmax(f1_scores[:-1]) 
+    best_threshold = thresholds[best_idx]
+
+    print(f"[INFO] Best threshold di angka: {best_threshold:.6f}")
+    print(f"[INFO] Ekspektasi F1-Score maksimal: {f1_scores[best_idx]:.4f}")
+
+    # Terapkan Threshold yang terpilih
+    pred_labels = (all_preds_prob > best_threshold).astype(int)
+
+    # Hitung Metrik Final
+    auroc = roc_auc_score(all_true_labels, all_preds_prob)
+    auprc = average_precision_score(all_true_labels, all_preds_prob)
+    cm = confusion_matrix(all_true_labels, pred_labels)
+
+    print(f"\nAUROC (Skor Ilusi)   : {auroc:.4f}")
+    print(f"AUPRC (Skor Jujur)   : {auprc:.4f}")
+
+    print("\n--- CLASSIFICATION REPORT ---")
+    print(classification_report(all_true_labels, pred_labels, target_names=['Normal (0)', 'Attack (1)'], zero_division=0))
+
+    print("--- CONFUSION MATRIX ---")
+    print(f"Benar-benar Normal (TN) : {cm[0][0]}")
+    print(f"Salah Tuduh Normal (FP) : {cm[0][1]}  <-- Alarm Palsu")
+    print(f"Salah Tuduh Aman   (FN) : {cm[1][0]}  <-- Hacker Lolos")
+    print(f"Berhasil Tangkap   (TP) : {cm[1][1]}  <-- Keberhasilan TGN")
+else:
+    print("Evaluasi lanjutan dilewati karena dataset tidak mengandung serangan.")
