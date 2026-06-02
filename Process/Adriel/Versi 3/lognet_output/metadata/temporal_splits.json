@@ -1,0 +1,26 @@
+{
+  "train": {
+    "start_ts": 1000020,
+    "end_ts": 1523859,
+    "n_events": 49508,
+    "n_attack": 0,
+    "n_normal": 49508,
+    "attack_ratio": 0.0
+  },
+  "val": {
+    "start_ts": 1523859,
+    "end_ts": 1636110,
+    "n_events": 7506,
+    "n_attack": 0,
+    "n_normal": 7506,
+    "attack_ratio": 0.0
+  },
+  "test": {
+    "start_ts": 1636110,
+    "end_ts": 1748362,
+    "n_events": 7510,
+    "n_attack": 0,
+    "n_normal": 7510,
+    "attack_ratio": 0.0
+  }
+}
