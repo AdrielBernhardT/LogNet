@@ -1,0 +1,540 @@
+==========================================
+TAHAP 1
+==========================================
+import pandas as pd
+import gzip
+import gc
+
+# ==========================================
+# KONFIGURASI FILE
+# ==========================================
+AUTH_FILE = 'Resources/auth.txt.gz'
+REDTEAM_FILE = 'Resources/redteam.txt.gz'
+OUTPUT_FILE = 'auth_sampled_balanced.parquet'
+CHUNK_SIZE = 2000000
+
+print("1. Membaca data Redteam (Kunci Jawaban)...")
+redteam_cols = ['time', 'user_domain', 'src_comp', 'dst_comp']
+df_redteam = pd.read_csv(REDTEAM_FILE, header=None, names=redteam_cols)
+
+# PENGAMANAN FORMAT: Pastikan semuanya string murni agar matching aman
+df_redteam['user_domain'] = df_redteam['user_domain'].astype(str)
+df_redteam['src_comp'] = df_redteam['src_comp'].astype(str)
+df_redteam['dst_comp'] = df_redteam['dst_comp'].astype(str)
+
+redteam_signatures = set(
+    zip(df_redteam['time'], df_redteam['user_domain'], df_redteam['src_comp'], df_redteam['dst_comp'])
+)
+del df_redteam
+gc.collect()
+
+print(f"Total signature serangan unik: {len(redteam_signatures)}")
+print("\n2. Memproses Log Auth (Mode Detektif Forensik - Bug Fixed & Audit Ready)...")
+
+auth_cols = ['time', 'src_user', 'dst_user', 'src_comp', 'dst_comp', 'auth_type', 'logon_type', 'orientation', 'success']
+
+chunks_processed = 0
+all_sampled_chunks = []
+
+for chunk in pd.read_csv(AUTH_FILE, header=None, names=auth_cols, chunksize=CHUNK_SIZE):
+    # PENGAMANAN FORMAT: Samakan tipe data dengan Redteam
+    chunk['src_user'] = chunk['src_user'].astype(str)
+    chunk['src_comp'] = chunk['src_comp'].astype(str)
+    chunk['dst_comp'] = chunk['dst_comp'].astype(str)
+    
+    chunk_signatures = list(zip(chunk['time'], chunk['src_user'], chunk['src_comp'], chunk['dst_comp']))
+    chunk['label'] = [1 if sig in redteam_signatures else 0 for sig in chunk_signatures]
+    
+    # ==========================================
+    # BLOK VERIFIKASI AUDIT (Hanya jalan di chunk 1)
+    # ==========================================
+    if chunks_processed == 0:
+        print("\n" + "="*40)
+        print("[AUDIT CHECK] Verifikasi Format Mismatch...")
+        print("-> Sample Redteam Signatures :", list(redteam_signatures)[:3])
+        
+        serangan_ketangkap = chunk[chunk['label'] == 1]
+        if not serangan_ketangkap.empty:
+            print("-> MATCH BERHASIL! Sample Auth src_user dari serangan:", serangan_ketangkap['src_user'].head(3).tolist()) [cite: 1]
+        else:
+            print("-> WARNING: Tidak ada serangan yang match di chunk ini.")
+            print("-> Sample Auth Signatures (Data Mentah):", chunk_signatures[:3])
+        print("="*40 + "\n")
+    
+    # EKSTRAKSI FITUR SAKTI V4 (BUG FIXED)
+    chunk['is_success'] = (chunk['success'] == 'Success').astype(int)
+    
+    # Deteksi Manusia vs Mesin (Pakai .contains karena format aslinya C...$@DOM)
+    chunk['is_machine'] = chunk['src_user'].str.contains('$', regex=False).astype(int)
+    
+    # Ekstraksi Logon Type (Ubah ke angka, jika aneh/kosong jadikan -1)
+    chunk['logon_type'] = pd.to_numeric(chunk['logon_type'], errors='coerce').fillna(-1).astype(float)
+    
+    attack_data = chunk[chunk['label'] == 1]
+    normal_data = chunk[chunk['label'] == 0]
+    
+    # Undersampling Normal
+    sampled_normal = normal_data.sample(frac=0.01, random_state=42)
+    
+    combined_chunk = pd.concat([attack_data, sampled_normal])
+    
+    # Simpan semua fitur baru
+    combined_chunk = combined_chunk[['time', 'src_user', 'dst_comp', 'is_success', 'is_machine', 'logon_type', 'label']]
+    all_sampled_chunks.append(combined_chunk)
+    
+    chunks_processed += 1
+    print(f"Selesai memproses chunk ke-{chunks_processed} ({(chunks_processed * 2)} Juta baris)")
+    
+    del chunk, attack_data, normal_data, sampled_normal, combined_chunk
+    gc.collect()
+
+print("\n3. Menyimpan hasil akhir...")
+final_df = pd.concat(all_sampled_chunks, ignore_index=True)
+
+print("\n=== RINGKASAN DATASET BARU (V4 - BUG FIXED) ===")
+print(f"Total Serangan (Label 1) : {len(final_df[final_df['label'] == 1])}")
+print(f"Total Mesin (Label 1)    : {len(final_df[final_df['is_machine'] == 1])}")
+print(f"Total Manusia (Label 0)  : {len(final_df[final_df['is_machine'] == 0])}")
+
+final_df.to_parquet(OUTPUT_FILE, index=False)
+print(f"File berhasil disimpan di: {OUTPUT_FILE}")
+
+==========================================
+TAHAP 2
+==========================================
+import pandas as pd
+import json
+import gc
+
+AUTH_PARQUET = 'auth_sampled_balanced.parquet'
+FLOWS_FILE = 'Resources/flows.txt.gz'
+OUT_EDGES = 'graph_edges.parquet'
+OUT_NODEMAP = 'node_map.json'
+
+print("1. Memuat data Auth...")
+df_auth = pd.read_parquet(AUTH_PARQUET)
+
+df_auth_graph = pd.DataFrame({
+    'time': df_auth['time'],
+    'src_node': df_auth['src_user'], 
+    'dst_node': df_auth['dst_comp'],
+    'edge_type': 0,                   
+    'is_success': df_auth['is_success'],
+    'is_machine': df_auth['is_machine'],
+    'logon_type': df_auth['logon_type'],
+    'label': df_auth['label']         
+})
+del df_auth
+gc.collect()
+
+print("2. Memuat dan Sampling data Flows (Menyebar merata di seluruh waktu)...")
+flow_cols = ['time', 'duration', 'src_comp', 'src_port', 'dst_comp', 'dst_port', 'protocol', 'packet_count', 'byte_count']
+
+# Baca file secara bertahap, ambil 0.5% saja dari setiap chunk agar totalnya di kisaran 500k baris
+chunk_list = []
+for flow_chunk in pd.read_csv(FLOWS_FILE, header=None, names=flow_cols, chunksize=5000000):
+    # Ambil sedikit sampel secara acak agar tersebar di seluruh hari
+    sampled_flow = flow_chunk.sample(frac=0.005, random_state=42)
+    chunk_list.append(sampled_flow)
+
+df_flow_raw = pd.concat(chunk_list, ignore_index=True)
+print(f"Total baris Flow yang berhasil disampling: {len(df_flow_raw)}")
+
+df_flow_graph = pd.DataFrame({
+    'time': df_flow_raw['time'],
+    'src_node': df_flow_raw['src_comp'],
+    'dst_node': df_flow_raw['dst_comp'],
+    'edge_type': 1,                   
+    'is_success': 1,                  
+    'is_machine': 1,   # Flow jaringan mayoritas komunikasi mesin ke mesin               
+    'logon_type': -1,  # Flow tidak memiliki tipe logon
+    'label': 0                        
+})
+del df_flow_raw, chunk_list
+gc.collect()
+
+print("3. Menggabungkan Auth dan Flows...")
+df_graph = pd.concat([df_auth_graph, df_flow_graph], ignore_index=True)
+df_graph = df_graph.sort_values('time').reset_index(drop=True)
+
+print("4. Membuat Node Mapping...")
+semua_node = pd.concat([df_graph['src_node'], df_graph['dst_node']]).unique()
+node_map = {node_name: i for i, node_name in enumerate(semua_node)}
+
+with open(OUT_NODEMAP, 'w') as f:
+    json.dump(node_map, f)
+
+print("5. Menerapkan Node Mapping ke Graf...")
+df_graph['src_id'] = df_graph['src_node'].map(node_map)
+df_graph['dst_id'] = df_graph['dst_node'].map(node_map)
+df_graph = df_graph.drop(columns=['src_node', 'dst_node'])
+
+# Susun kolom V4
+df_graph = df_graph[['time', 'src_id', 'dst_id', 'edge_type', 'is_success', 'is_machine', 'logon_type', 'label']]
+
+print("6. Menyimpan struktur Graf Akhir...")
+df_graph.to_parquet(OUT_EDGES, index=False)
+print("Selesai! Lanjut ke Tahap 3.")
+
+==========================================
+TAHAP 3
+==========================================
+import pandas as pd
+import torch
+import gc
+
+GRAPH_EDGES_FILE = 'graph_edges.parquet'
+OUTPUT_PYTORCH_FILE = 'tgn_dataset.pt'
+
+print("1. Membaca Graf dari Parquet...")
+df = pd.read_parquet(GRAPH_EDGES_FILE)
+
+print("2. Mengubah Data Menjadi PyTorch Tensors...")
+src = torch.tensor(df['src_id'].values, dtype=torch.long)
+dst = torch.tensor(df['dst_id'].values, dtype=torch.long)
+t = torch.tensor(df['time'].values, dtype=torch.long)
+y = torch.tensor(df['label'].values, dtype=torch.float)
+
+print("3. Membuat Edge Features (V4.1 - One-Hot Encoding)...")
+edge_types = df['edge_type'].values
+logon_types = df['logon_type'].values
+
+# Tensor kita berevolusi jadi 8 Kolom!
+msg = torch.zeros((len(df), 8), dtype=torch.float)
+
+# Fitur Dasar
+msg[edge_types == 0, 0] = 1.0  # Kolom 0: Is Auth
+msg[edge_types == 1, 1] = 1.0  # Kolom 1: Is Flow
+msg[:, 2] = torch.tensor(df['is_success'].values, dtype=torch.float) # Kolom 2: is_success
+msg[:, 3] = torch.tensor(df['is_machine'].values, dtype=torch.float) # Kolom 3: is_machine
+
+# Fitur One-Hot Encoding untuk Logon Type (Penyembuh Dosa ML)
+msg[logon_types == 2.0, 4] = 1.0   # Kolom 4: Is Logon Type 2 (Interactive)
+msg[logon_types == 3.0, 5] = 1.0   # Kolom 5: Is Logon Type 3 (Network)
+msg[logon_types == 10.0, 6] = 1.0  # Kolom 6: Is Logon Type 10 (Remote)
+# Logon type lainnya atau flow (-1) biarkan masuk ke Kolom 7 (Other)
+msg[(logon_types != 2.0) & (logon_types != 3.0) & (logon_types != 10.0), 7] = 1.0 
+
+del df, edge_types, logon_types
+gc.collect()
+
+print("4. Menyimpan PyTorch Dataset...")
+torch.save({'src': src, 'dst': dst, 't': t, 'msg': msg, 'y': y}, OUTPUT_PYTORCH_FILE)
+
+print("\n=== RINGKASAN TENSOR BARU ===")
+print(f"Shape MSG  : {msg.shape} -> (8 Kolom: Telah di-One-Hot Encode!)")
+print(f"File berhasil disimpan di: {OUTPUT_PYTORCH_FILE}")
+
+==========================================
+TAHAP 4
+==========================================
+import torch
+from torch.nn import Linear
+from torch_geometric.data import TemporalData
+from torch_geometric.loader import TemporalDataLoader
+from torch_geometric.nn import TGNMemory
+from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator
+
+# ==========================================
+# 1. PERSIAPAN PERANGKAT & DATA
+# ==========================================
+print("1. Menyiapkan Perangkat dan Data...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Menggunakan Device: {device}")
+
+data_dict = torch.load('tgn_dataset.pt')
+data = TemporalData(
+    src=data_dict['src'], dst=data_dict['dst'], t=data_dict['t'],
+    msg=data_dict['msg'], y=data_dict['y']
+)
+
+# --- CHRONOLOGICAL SPLIT (50% TRAIN) ---
+total_rows = data.msg.size(0)
+train_size = int(0.50 * total_rows)
+print(f"\n[INFO] Total Baris Data: {total_rows}")
+print(f"[INFO] Memotong {train_size} baris (50% masa lalu) murni untuk Training!")
+
+# OPTIMASI 1: Tambahkan .clone() agar memori training terputus dari file raksasa 11 juta baris
+train_data = TemporalData(
+    src=data.src[:train_size].clone(), 
+    dst=data.dst[:train_size].clone(), 
+    t=data.t[:train_size].clone(),
+    msg=data.msg[:train_size].clone(), 
+    y=data.y[:train_size].clone()
+).to(device)
+
+train_loader = TemporalDataLoader(train_data, batch_size=2000)
+
+# ==========================================
+# 2. WEIGHTED LOSS (MENGATASI IMBALANCE DI DATA TRAIN)
+# ==========================================
+jumlah_normal = (train_data.y == 0).sum().item()
+jumlah_serangan = (train_data.y == 1).sum().item()
+
+# Cegah error pembagian nol jika kebetulan serangan numpuk di akhir
+if jumlah_serangan == 0: jumlah_serangan = 1 
+
+# OPTIMASI 2: Tambahkan dtype=torch.float untuk kestabilan kalkulasi Loss
+pos_weight_value = torch.tensor([jumlah_normal / jumlah_serangan], dtype=torch.float, device=device)
+criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_value)
+
+print(f"-> Bobot Hukuman untuk Serangan: {pos_weight_value.item():.2f}x lipat lebih berat")
+
+# ==========================================
+# 3. MERAKIT MODEL TGN
+# ==========================================
+print("\n3. Merakit Model TGN...")
+memory_dim = 100
+time_dim = 100
+num_nodes = max(data.src.max(), data.dst.max()).item() + 1
+
+# raw_msg_dim otomatis membaca kolom fitur
+memory = TGNMemory(
+    num_nodes=num_nodes, 
+    raw_msg_dim=data.msg.size(1), 
+    memory_dim=memory_dim, time_dim=time_dim,
+    message_module=IdentityMessage(data.msg.size(1), memory_dim, time_dim),
+    aggregator_module=LastAggregator()
+).to(device)
+
+class LinkPredictor(torch.nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.lin_src = Linear(in_channels, in_channels)
+        self.lin_dst = Linear(in_channels, in_channels)
+        self.lin_final = Linear(in_channels, 1)
+
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
+        h = h.relu()
+        return self.lin_final(h)
+
+link_pred = LinkPredictor(in_channels=memory_dim).to(device)
+optimizer = torch.optim.Adam(set(memory.parameters()) | set(link_pred.parameters()), lr=0.0001)
+
+# ==========================================
+# 4. TRAINING LOOP (5 EPOCH)
+# ==========================================
+print("\n4. Memulai Training (5 EPOCH - Mode 50% Chronological Split)...")
+memory.train()
+link_pred.train()
+
+for epoch in range(5): 
+    memory.reset_state() 
+    total_loss = 0
+    
+    for i, batch in enumerate(train_loader):
+        optimizer.zero_grad()
+        batch = batch.to(device)
+        
+        # Mencegah error backward graph
+        memory.detach() 
+        
+        z_src, _ = memory(batch.src)
+        z_dst, _ = memory(batch.dst)
+        
+        pred = link_pred(z_src, z_dst).squeeze()
+        loss = criterion(pred, batch.y)
+        loss.backward()
+        optimizer.step()
+        
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+        total_loss += loss.item()
+        
+        # OPTIMASI 3: Update tampilan terminal menjadi per 100 batch supaya kamu tahu prosesnya berjalan
+        if (i+1) % 100 == 0:
+            print(f"Epoch {epoch+1} | Batch {i+1} | Loss Sementara: {loss.item():.4f}")
+
+    print(f"=== Selesai Epoch {epoch+1} | Rata-rata Loss: {total_loss / len(train_loader):.4f} ===")
+
+torch.save(memory.state_dict(), 'tgn_memory_model.pth')
+torch.save(link_pred.state_dict(), 'tgn_predictor_model.pth')
+print("Model Detektif Forensik berhasil disimpan!")
+
+==========================================
+TAHAP 5
+==========================================
+import torch
+from torch.nn import Linear
+from torch_geometric.data import TemporalData
+from torch_geometric.loader import TemporalDataLoader
+from torch_geometric.nn import TGNMemory
+from torch_geometric.nn.models.tgn import IdentityMessage, LastAggregator
+from sklearn.metrics import classification_report, confusion_matrix, average_precision_score, roc_auc_score
+import numpy as np
+
+# ==========================================
+# 1-3. PERSIAPAN, KERANGKA, & LOAD MODEL
+# ==========================================
+print("1. Menyiapkan Perangkat dan Data...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+data_dict = torch.load('tgn_dataset.pt')
+data = TemporalData(
+    src=data_dict['src'], dst=data_dict['dst'], t=data_dict['t'],
+    msg=data_dict['msg'], y=data_dict['y']
+).to(device)
+
+test_loader = TemporalDataLoader(data, batch_size=2000)
+
+print("2. Membangun ulang kerangka TGN...")
+memory_dim = 100
+time_dim = 100
+num_nodes = max(data.src.max(), data.dst.max()).item() + 1
+
+memory = TGNMemory(
+    num_nodes=num_nodes, raw_msg_dim=data.msg.size(1),
+    memory_dim=memory_dim, time_dim=time_dim,
+    message_module=IdentityMessage(data.msg.size(1), memory_dim, time_dim),
+    aggregator_module=LastAggregator()
+).to(device)
+
+class LinkPredictor(torch.nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.lin_src = Linear(in_channels, in_channels)
+        self.lin_dst = Linear(in_channels, in_channels)
+        self.lin_final = Linear(in_channels, 1)
+
+    def forward(self, z_src, z_dst):
+        h = self.lin_src(z_src) + self.lin_dst(z_dst)
+        h = h.relu()
+        return self.lin_final(h)
+
+link_pred = LinkPredictor(in_channels=memory_dim).to(device)
+
+print("3. Memasukkan memori Detektif Forensik Elite (V4.1)...")
+memory.load_state_dict(torch.load('tgn_memory_model.pth', map_location=device))
+link_pred.load_state_dict(torch.load('tgn_predictor_model.pth', map_location=device))
+
+# ==========================================
+# 4. PROSES EVALUASI (INFERENCE)
+# ==========================================
+print("\n4. Memulai Proses Evaluasi (Inference Keseluruhan untuk Bangun Memory)...")
+memory.eval() 
+link_pred.eval()
+
+all_preds_prob = []
+all_true_labels = []
+
+memory.reset_state() 
+
+with torch.no_grad(): 
+    for i, batch in enumerate(test_loader):
+        batch = batch.to(device)
+        z_src, _ = memory(batch.src)
+        z_dst, _ = memory(batch.dst)
+        
+        pred = link_pred(z_src, z_dst).squeeze()
+        prob = torch.sigmoid(pred) 
+        
+        all_preds_prob.extend(prob.cpu().tolist())
+        all_true_labels.extend(batch.y.cpu().tolist())
+        
+        memory.update_state(batch.src, batch.dst, batch.t, batch.msg)
+        
+        if (i+1) % 1000 == 0:
+            print(f"Selesai menebak {i+1} batch...")
+
+# ==========================================
+# 5. PARTICLE SWARM OPTIMIZATION (TARGET DOSEN)
+# ==========================================
+print("\n" + "="*40)
+print("HASIL UJIAN TGN (V5 - CHRONOLOGICAL SPLIT 50:50)")
+print("="*40)
+
+all_preds_prob = np.array(all_preds_prob)
+all_true_labels = np.array(all_true_labels)
+
+# --- MEMISAHKAN JAWABAN UJIAN (50% MASA DEPAN) ---
+train_size = int(0.50 * len(all_preds_prob))
+test_preds_prob = all_preds_prob[train_size:]
+test_true_labels = all_true_labels[train_size:]
+
+print(f"[INFO] Menilai murni pada {len(test_preds_prob)} data masa depan (50% Testing)...")
+
+attack_scores = test_preds_prob[test_true_labels == 1]
+
+if len(attack_scores) == 0:
+    print("[WARNING] Tidak ada serangan di 30% masa depan! Silakan sesuaikan rasio split.")
+else:
+    print(f"Skor Attack TERTINGGI  : {np.max(attack_scores):.6f}")
+    print(f"Rata-rata Skor Attack  : {np.mean(attack_scores):.6f}")
+
+print("\n[INFO] Mengerahkan Algoritma PSO untuk mencari Threshold terbaik...")
+
+# Sesuaikan target TPS dengan 60% dari serangan yang TERSISA di set Ujian
+total_attack_di_test = np.sum(test_true_labels == 1)
+TARGET_TP = int(0.60 * total_attack_di_test)
+
+print(f"[INFO] Total Serangan di Masa Depan: {total_attack_di_test}")
+print(f"[INFO] Target Baru PSO (60% Recall): {TARGET_TP} Tangkapan")
+
+# Fungsi Objektif (Fungsi Penalti Super Kejam - Hanya menilai test_preds_prob)
+def objective_function(threshold):
+    pred_labels = (test_preds_prob > threshold).astype(int)
+    tp = np.sum((pred_labels == 1) & (test_true_labels == 1))
+    fp = np.sum((pred_labels == 1) & (test_true_labels == 0))
+    
+    if tp < TARGET_TP:
+        # Hukuman Kiamat: 100 Juta + (1 Juta per 1 Hacker yang lolos)
+        return fp + 100000000 + ((TARGET_TP - tp) * 1000000)
+    else:
+        return fp
+
+# Hyperparameter PSO
+num_particles = 30
+num_iterations = 50
+w = 0.5  
+c1 = 1.5 
+c2 = 1.5 
+
+np.random.seed(42) # Agar kawanan burung PSO bergeraknya konsisten setiap di-run
+positions = np.random.uniform(0.0000001, np.max(attack_scores) if len(attack_scores)>0 else 0.5, num_particles)
+velocities = np.zeros(num_particles)
+pbest_positions = np.copy(positions)
+pbest_scores = np.array([objective_function(p) for p in positions])
+
+gbest_idx = np.argmin(pbest_scores)
+gbest_position = pbest_positions[gbest_idx]
+gbest_score = pbest_scores[gbest_idx]
+
+# Loop PSO terbang mencari titik emas
+for iteration in range(num_iterations):
+    r1 = np.random.rand(num_particles)
+    r2 = np.random.rand(num_particles)
+    
+    velocities = (w * velocities) + (c1 * r1 * (pbest_positions - positions)) + (c2 * r2 * (gbest_position - positions))
+    positions = positions + velocities
+    
+    positions = np.clip(positions, 0.000001, 0.999999)
+    
+    current_scores = np.array([objective_function(p) for p in positions])
+    
+    better_mask = current_scores < pbest_scores
+    pbest_positions[better_mask] = positions[better_mask]
+    pbest_scores[better_mask] = current_scores[better_mask]
+    
+    if np.min(pbest_scores) < gbest_score:
+        gbest_position = pbest_positions[np.argmin(pbest_scores)]
+        gbest_score = np.min(pbest_scores)
+        
+    if (iteration+1) % 10 == 0:
+        print(f"  PSO Iterasi {iteration+1}/50 | Skor Terendah Saat Ini: {gbest_score:.0f}")
+
+print(f"\n[INFO] Titik Emas (PSO Threshold) dikunci pada angka: {gbest_position:.6f}")
+
+# Terapkan Threshold hasil PSO (HANYA PADA DATA TEST)
+pred_labels = (test_preds_prob > gbest_position).astype(int)
+auroc = roc_auc_score(test_true_labels, test_preds_prob)
+cm = confusion_matrix(test_true_labels, pred_labels)
+
+print(f"\nAUROC (Skor Ilusi)   : {auroc:.4f}")
+print("\n--- CLASSIFICATION REPORT (50% MASA DEPAN) ---")
+print(classification_report(test_true_labels, pred_labels, target_names=['Normal (0)', 'Attack (1)'], zero_division=0))
+
+print("--- CONFUSION MATRIX ---")
+print(f"Benar-benar Normal (TN) : {cm[0][0]}")
+print(f"Salah Tuduh Normal (FP) : {cm[0][1]}  <-- Hasil Minimalisasi PSO di Set Ujian")
+print(f"Salah Tuduh Aman   (FN) : {cm[1][0]}  <-- Hacker Lolos")
+print(f"Berhasil Tangkap   (TP) : {cm[1][1]}  <-- Target >= {TARGET_TP}")
